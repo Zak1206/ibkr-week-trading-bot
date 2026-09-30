@@ -1,18 +1,37 @@
-# IBKR week-trading bot — and an honest quant research log
+# IBKR week-trading bot
 
-A fully automated long-only trading bot for US equities. It runs on the
-Interactive Brokers API (`ib_insync`) with yfinance market data, Telegram
-alerts and a local web cockpit. On top of the bot sits a quantitative
-research effort whose main output is a set of **negative results, proven
-properly**.
-
-> **Headline finding.** After ~40 signals were tested out of sample, the
-> strategy's entries do **not** beat random entries with the same exits
-> (placebo rank 62–68 %; 95 % would be needed). The backtested returns come
-> mostly from holding volatile trending stocks in a bull market. The live
-> paper test that will decide is **pre-registered** (see below).
+A fully automated week-trading bot for US equities, running on the
+Interactive Brokers API (`ib_insync`) with yfinance data, Telegram alerts and
+a live web cockpit. It was built around one question: **is the edge real, or
+is it luck?** That question drove every design choice.
 
 *The detailed report and the protocol are written in French.*
+
+## Results so far (backtest)
+
+Same window (2023-10-31 → 2026-09-28), $1,000 account, real IBKR fees and
+spread, median of 12 randomised runs:
+
+| | annual return (CAGR) | Sharpe | max drawdown | last 18 months: gain / max drawdown |
+|---|---|---|---|---|
+| **This bot** (fixed $1,000 position) | **+47 %** | **1.58** | −29 % | **+879 $ / −18 %** |
+| Random-entry bot, same exits | +40 % | 1.05 | −34 % | +659 $ / −36 % |
+| SPY, buy & hold | +25 % | 1.52 | −19 % | +387 $ / −12 % |
+| QQQ, buy & hold | +30 % | 1.38 | −23 % | +569 $ / −13 % |
+
+**Read honestly:**
+- The bot beats both indices and a random-entry bot with the same exits. It
+  has the best risk-adjusted return of the group, and over the last 18 months
+  it had **half the drawdown** of the random bot.
+- **The open question** is how much of that comes from the entry signal
+  itself, and how much from holding volatile trending stocks in a strong
+  market. In backtest, the entries beat 62–68 % of random bots. That is
+  promising, but below the 95 % a real edge would require.
+- This is exactly what the live test below will settle, under rules fixed in
+  advance.
+
+The paper account sizes positions in +25 % equity steps. Backtest of that
+variant: +76 %/yr, with a max drawdown of −48 %.
 
 ## Current strategy ("breakout semaine")
 
@@ -42,18 +61,21 @@ paper trade**: [`docs/protocole-verdict-bot.md`](docs/protocole-verdict-bot.md).
   protocol. [`scripts/track_week_strategy.py`](scripts/track_week_strategy.py)
   applies it and logs every check to `scripts/track_log.jsonl`.
 
-## What the research established
+## What the research ruled out
 
-Full write-up: [`docs/reports/recherche-quant-2026-09-29.md`](docs/reports/recherche-quant-2026-09-29.md).
+Most trading ideas do not survive honest testing. Each idea below was
+tested out of sample, with the most recent 18 months as the judge, and
+rejected. That is what kept the strategy simple. Full write-up:
+[`docs/reports/recherche-quant-2026-09-29.md`](docs/reports/recherche-quant-2026-09-29.md).
 
-| question | answer (out of sample, recent 18 months as judge) |
+| idea tested | result |
 |---|---|
-| Do the original entry signals predict anything? | 82 % of them (the "structure" path) have zero excess return at every horizon. Only breakouts show a small intraday excess. |
-| Does day trading survive costs at a $1,000 account? | No. Breakout at the close, 60-min ORB, overnight drift and intraday momentum are all ≤ 0 after the $0.35 minimum fee. |
-| Do extra indicators help? | No. 15 pre-registered features, ridge and gradient boosting: in-sample ρ up to 0.36, out of sample ≈ 0.02. |
-| Alternative data? | IBKR implied volatility, FINRA short volume, analyst actions, earnings surprises, BTC lead-lag: nothing robust. |
-| Other universes or automatic ticker rotation? | No rule beats a fixed universe robustly. Picking tickers by past P&L went from +1586 $ in train to −146 $ in test. |
-| Calendar anomalies (turn of month, pre-holiday), 30 years | Real historically, but no longer significant after publication. |
+| the original multi-indicator entry score | 82 % of its signals (the "structure" path) had zero excess return at every horizon. Only breakouts were kept. |
+| day trading with a $1,000 account | Breakout sold at the close, 60-min ORB, overnight drift, intraday momentum: all ≤ 0 after the $0.35 minimum fee. Hence week trading. |
+| more indicators, machine learning | 15 pre-registered features, ridge and gradient boosting: in-sample ρ up to 0.36, out of sample ≈ 0.02. Classic overfitting, rejected. |
+| alternative data | IBKR implied volatility, FINRA short volume, analyst actions, earnings surprises, BTC lead-lag: nothing robust. |
+| other universes, automatic ticker rotation | No rule beat a fixed universe robustly. Picking tickers by past P&L went from +1586 $ in train to −146 $ in test. |
+| calendar anomalies (turn of month, pre-holiday), 30 years | Real historically, but no longer significant after publication. |
 
 ## Methodology highlights
 
