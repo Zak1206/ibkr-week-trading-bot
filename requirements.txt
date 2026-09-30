@@ -1,0 +1,8 @@
+# Versions epinglees: evite que pip compile pandas depuis les sources (Windows + Python 3.12).
+numpy>=1.26,<2
+pandas==2.2.3
+yfinance
+requests
+openai
+python-dotenv
+ib-insync>=0.9.86

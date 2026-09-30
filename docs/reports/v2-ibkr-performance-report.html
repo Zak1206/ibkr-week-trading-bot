@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=1200" />
+  <title>V2 — Performance Report | Paper IBKR</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+      background: #e8eaed;
+      color: #1a1f2e;
+      padding: 32px;
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: flex-start;
+    }
+    .report {
+      width: 1080px;
+      background: #ffffff;
+      border: 1px solid #d4d8e0;
+    }
+    .header {
+      background: #0f1c2e;
+      color: #fff;
+      padding: 28px 36px 24px;
+      border-bottom: 3px solid #22c55e;
+    }
+    .header-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-bottom: 20px;
+    }
+    .brand {
+      font-size: 11px;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: #8fa3bf;
+      font-weight: 600;
+    }
+    .phase {
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: #4ade80;
+      background: rgba(34, 197, 94, 0.12);
+      padding: 4px 10px;
+      border: 1px solid rgba(34, 197, 94, 0.35);
+    }
+    h1 {
+      font-size: 26px;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+      margin-bottom: 6px;
+    }
+    .subtitle {
+      font-size: 14px;
+      color: #a8b8cc;
+      font-weight: 400;
+    }
+    .meta-row {
+      display: flex;
+      gap: 32px;
+      margin-top: 18px;
+      padding-top: 18px;
+      border-top: 1px solid rgba(255,255,255,0.1);
+      font-size: 12px;
+      color: #8fa3bf;
+    }
+    .meta-row span strong { color: #dde4ef; font-weight: 500; }
+    .body { padding: 28px 36px 32px; }
+    .hero {
+      display: grid;
+      grid-template-columns: 1.4fr 1fr 1fr 1fr;
+      gap: 1px;
+      background: #d4d8e0;
+      border: 1px solid #d4d8e0;
+      margin-bottom: 28px;
+    }
+    .hero-cell {
+      background: #f7f8fa;
+      padding: 20px 22px;
+    }
+    .hero-cell.primary {
+      background: #0f1c2e;
+      color: #fff;
+    }
+    .label {
+      font-size: 10px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: #6b7280;
+      margin-bottom: 8px;
+      font-weight: 600;
+    }
+    .hero-cell.primary .label { color: #8fa3bf; }
+    .value {
+      font-size: 28px;
+      font-weight: 600;
+      letter-spacing: -0.03em;
+      font-variant-numeric: tabular-nums;
+    }
+    .hero-cell.primary .value { font-size: 36px; color: #4ade80; }
+    .value.sm { font-size: 22px; }
+    .sub {
+      font-size: 12px;
+      color: #6b7280;
+      margin-top: 4px;
+      font-variant-numeric: tabular-nums;
+    }
+    .hero-cell.primary .sub { color: #8fa3bf; }
+    .section-title {
+      font-size: 11px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: #6b7280;
+      font-weight: 700;
+      margin-bottom: 12px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid #e5e7eb;
+    }
+    .grid-2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 28px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      font-variant-numeric: tabular-nums;
+    }
+    th {
+      text-align: left;
+      font-size: 10px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: #6b7280;
+      font-weight: 600;
+      padding: 8px 12px;
+      background: #f3f4f6;
+      border-bottom: 1px solid #e5e7eb;
+    }
+    th.right, td.right { text-align: right; }
+    td {
+      padding: 9px 12px;
+      border-bottom: 1px solid #f0f1f3;
+      color: #374151;
+    }
+    tr:last-child td { border-bottom: none; }
+    .pos { color: #15803d; font-weight: 600; }
+    .neg { color: #b91c1c; font-weight: 600; }
+    .stats-list { list-style: none; }
+    .stats-list li {
+      display: flex;
+      justify-content: space-between;
+      padding: 10px 0;
+      border-bottom: 1px solid #f0f1f3;
+      font-size: 13px;
+    }
+    .stats-list li:last-child { border-bottom: none; }
+    .stats-list .k { color: #6b7280; }
+    .stats-list .v { font-weight: 600; font-variant-numeric: tabular-nums; }
+    .footer {
+      margin-top: 24px;
+      padding-top: 16px;
+      border-top: 1px solid #e5e7eb;
+      display: flex;
+      justify-content: space-between;
+      font-size: 11px;
+      color: #9ca3af;
+    }
+    .note {
+      margin-top: 20px;
+      padding: 12px 14px;
+      background: #f7f8fa;
+      border-left: 3px solid #22c55e;
+      font-size: 12px;
+      color: #4b5563;
+      line-height: 1.5;
+    }
+    .compare {
+      margin-top: 20px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    .compare-card {
+      padding: 14px 16px;
+      background: #f7f8fa;
+      border: 1px solid #e5e7eb;
+      font-size: 12px;
+    }
+    .compare-card h3 {
+      font-size: 10px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: #6b7280;
+      margin-bottom: 8px;
+    }
+    .compare-card .big {
+      font-size: 18px;
+      font-weight: 600;
+      color: #0f1c2e;
+    }
+  </style>
+</head>
+<body>
+  <div class="report">
+    <header class="header">
+      <div class="header-top">
+        <div class="brand">Trading Bot — Build in Public</div>
+        <div class="phase">Phase V2</div>
+      </div>
+      <h1>Performance Report</h1>
+      <p class="subtitle">Exécution automatique IBKR · SL/TP broker · Cockpit web live · Paper trading</p>
+      <div class="meta-row">
+        <span>Période <strong>23 mai — 25 juin 2026</strong></span>
+        <span>Budget réf. <strong>1 000 USD</strong></span>
+        <span>Source <strong>trades_journal.jsonl (dedup)</strong></span>
+      </div>
+    </header>
+
+    <div class="body">
+      <div class="hero">
+        <div class="hero-cell primary">
+          <div class="label">PnL réalisé</div>
+          <div class="value">+102,42 $</div>
+          <div class="sub">+10,2 % sur budget · solde 1 102,42 $</div>
+        </div>
+        <div class="hero-cell">
+          <div class="label">Trades clos</div>
+          <div class="value sm">63</div>
+          <div class="sub">~5 semaines paper IBKR</div>
+        </div>
+        <div class="hero-cell">
+          <div class="label">Win rate</div>
+          <div class="value sm">62 %</div>
+          <div class="sub">39 gains · 24 pertes</div>
+        </div>
+        <div class="hero-cell">
+          <div class="label">Risk / Reward</div>
+          <div class="value sm">1 : 2</div>
+          <div class="sub">Cible SL −2 % · TP +4 %</div>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div>
+          <div class="section-title">PnL par ticker (réalisé, cumul)</div>
+          <table>
+            <thead>
+              <tr>
+                <th>Ticker</th>
+                <th class="right">PnL USD</th>
+                <th class="right">Trades</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td>HOOD</td><td class="right pos">+26,27</td><td class="right">6</td></tr>
+              <tr><td>UNH</td><td class="right pos">+20,54</td><td class="right">2</td></tr>
+              <tr><td>SOFI</td><td class="right pos">+19,55</td><td class="right">6</td></tr>
+              <tr><td>SMCI</td><td class="right pos">+16,42</td><td class="right">8</td></tr>
+              <tr><td>IONQ</td><td class="right pos">+14,22</td><td class="right">7</td></tr>
+              <tr><td>RIVN</td><td class="right pos">+8,52</td><td class="right">1</td></tr>
+              <tr><td>CVS</td><td class="right pos">+7,76</td><td class="right">2</td></tr>
+              <tr><td>RGTI</td><td class="right pos">+7,08</td><td class="right">8</td></tr>
+              <tr><td>RKLB</td><td class="right pos">+6,54</td><td class="right">2</td></tr>
+              <tr><td>PLTR</td><td class="right pos">+2,95</td><td class="right">2</td></tr>
+              <tr><td>QBTS</td><td class="right neg">−11,20</td><td class="right">2</td></tr>
+              <tr><td>DIS</td><td class="right neg">−6,41</td><td class="right">3</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div>
+          <div class="section-title">Synthèse opérationnelle</div>
+          <ul class="stats-list">
+            <li><span class="k">Courtier</span><span class="v">IBKR (auto)</span></li>
+            <li><span class="k">API</span><span class="v">IB Gateway + ib_insync</span></li>
+            <li><span class="k">Alertes</span><span class="v">Telegram (signal + clôture)</span></li>
+            <li><span class="k">Univers</span><span class="v">~12 actions US momentum</span></li>
+            <li><span class="k">Scan</span><span class="v">Toutes les 15 min (hybrid)</span></li>
+            <li><span class="k">Gain moyen (win)</span><span class="v pos">+5,42 $ (+3,4 %)</span></li>
+            <li><span class="k">Perte moyenne (loss)</span><span class="v neg">−4,54 $ (−2,9 %)</span></li>
+            <li><span class="k">Max positions</span><span class="v">5 slots · ~200 $/ligne</span></li>
+            <li><span class="k">Observabilité</span><span class="v">Cockpit web + journal JSONL</span></li>
+          </ul>
+
+          <div class="compare">
+            <div class="compare-card">
+              <h3>V1 eToro</h3>
+              <div class="big">+157 $ · 65 % WR</div>
+              <div class="sub">37 trades · 6 sem. · manuel</div>
+            </div>
+            <div class="compare-card">
+              <h3>V2 IBKR</h3>
+              <div class="big">+102 $ · 62 % WR</div>
+              <div class="sub">63 trades · 5 sem. · auto</div>
+            </div>
+          </div>
+
+          <div class="note">
+            Phase V2 : le bot passe les ordres, pose SL/TP chez IBKR et synchronise chaque clôture.
+            SL/TP recalculés sur le prix de fill réel. Bilan arrêté au 25 juin 2026 (clôture de phase paper).
+          </div>
+        </div>
+      </div>
+
+      <footer class="footer">
+        <span>Paper IBKR · 23 mai — 25 juin 2026</span>
+        <span>Paper trading — pas de conseil en investissement</span>
+      </footer>
+    </div>
+  </div>
+</body>
+</html>

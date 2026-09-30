@@ -1,0 +1,44 @@
+# --- Secrets & profils env (NE JAMAIS COMMITTER) ---
+.env
+.env.*
+*.env
+
+# --- Etat runtime du bot (source de verite locale, pas du code) ---
+positions*.json
+trades_journal*.jsonl
+cockpit_live*.json
+flash_state*.json
+swap_pending*.json
+telegram_offset*.json
+premarket_prep_state*.json
+fundamental_cache*.json
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# --- Gros binaires / installeurs ---
+installers/
+
+# --- Archives de campagnes (contiennent env snapshots + journaux) ---
+archive/
+
+# --- Notes internes (identifiants de compte, contexte de l'assistant) ---
+CLAUDE.md
+CONTEXT_ARCHIVE.md
+docs/projet-bot-resume.md
+
+# --- Outils locaux ---
+.claude/
+.cursor/
+.omc/
+.playwright-mcp/
+*.lock
+*.log
+
+# --- Caches et sorties de recherche (donnees Yahoo / FINRA: non redistribuables, volumineuses) ---
+*.pkl
+scripts/*.csv
+scripts/research_earnings_dates.json

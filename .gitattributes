@@ -1,0 +1,5 @@
+# Fins de ligne LF partout: les empreintes SHA-256 du protocole (docs/protocole-verdict-bot.md)
+# portent sur ces octets; une conversion CRLF les changerait.
+* text=auto eol=lf
+*.pkl binary
+*.exe binary

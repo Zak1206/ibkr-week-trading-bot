@@ -1,0 +1,151 @@
+{
+ "cybersecurite": [
+  "PANW",
+  "CRWD",
+  "FTNT",
+  "CSCO",
+  "AVGO",
+  "NET",
+  "OKTA",
+  "ZS",
+  "FFIV",
+  "RBRK",
+  "QLYS",
+  "GD"
+ ],
+ "mineurs crypto / blockchain": [
+  "CIFR",
+  "NBIS",
+  "HUT",
+  "IREN",
+  "RIOT",
+  "WULF",
+  "CRWV",
+  "WYFI",
+  "COIN",
+  "CRCL",
+  "BMNR",
+  "GLXY"
+ ],
+ "semi-conducteurs": [
+  "NVDA",
+  "TSM",
+  "AVGO",
+  "MU",
+  "AMD",
+  "ASML",
+  "LRCX",
+  "AMAT",
+  "ADI",
+  "TXN",
+  "INTC",
+  "MRVL"
+ ],
+ "logiciel / IA": [
+  "PLTR",
+  "PANW",
+  "MSFT",
+  "CRWD",
+  "CRM",
+  "ORCL",
+  "NOW",
+  "ADBE",
+  "FTNT",
+  "INTU",
+  "SPCX",
+  "NFLX"
+ ],
+ "biotech": [
+  "MRNA",
+  "TWST",
+  "APGE",
+  "KYMR",
+  "HALO",
+  "NTRA",
+  "PRAX",
+  "ORKA",
+  "RVMD",
+  "TVTX"
+ ],
+ "energie propre": [
+  "FSLR",
+  "BE",
+  "NXT",
+  "ENPH",
+  "PLUG",
+  "HASI",
+  "RUN",
+  "CWEN",
+  "SEDG"
+ ],
+ "spatial / defense": [
+  "GRMN",
+  "TRMB",
+  "SIRI",
+  "VSAT",
+  "SPCX",
+  "ECHO",
+  "ASTS",
+  "IRDM",
+  "PL",
+  "GSAT",
+  "GE",
+  "RTX"
+ ],
+ "quantique": [
+  "ESTC",
+  "ARQQ",
+  "HQ",
+  "PLTR",
+  "NET",
+  "SNOW",
+  "NTNX",
+  "RDNT",
+  "MDB"
+ ],
+ "fintech": [
+  "SHOP",
+  "CRCL",
+  "XYZ",
+  "COIN",
+  "HOOD",
+  "PLTR",
+  "TOST",
+  "AMZN",
+  "BLSH",
+  "PYPL",
+  "FISV",
+  "GPN"
+ ],
+ "uranium / nucleaire": [
+  "OKLO",
+  "UEC",
+  "KAP",
+  "XE",
+  "LEU",
+  "CEG",
+  "PEG",
+  "BWXT"
+ ],
+ "tech chinoise": [
+  "PDD"
+ ],
+ "innovation (ARKK)": [
+  "TSLA",
+  "SPCX",
+  "CRCL",
+  "TEM",
+  "COIN",
+  "CRSP",
+  "TWST",
+  "HOOD",
+  "SHOP",
+  "PLTR"
+ ],
+ "crypto en direct (ETF spot)": [
+  "IBIT",
+  "ETHA",
+  "FBTC",
+  "BITB"
+ ]
+}
