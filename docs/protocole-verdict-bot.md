@@ -98,6 +98,7 @@ décisions est autorisée et notée dans ce document, avec la date.
 | 30/09/2026, avant tout trade | bots explicitement sans filtre (VIX, tendance, breakout) | on teste toute la règle d'entrée |
 | 30/09/2026, avant tout trade | rang retenu = min(rang du paper, rang du backtest) | neutralise l'écart d'exécution réel / simulé |
 | 30/09/2026, avant tout trade | coupe-circuit désigné par sa clé de config (50 %) | lève l'ambiguïté avec l'ancienne valeur de 35 % |
+| 30/09/2026, 18h50, avant tout trade | `main.py` : les textes de log et de justification affichent l'intervalle scanné (`YF_INTERVAL`, 1h en paper) au lieu de « 15m » écrit en dur. Empreinte `b21c9931…` → `2186d73d…` | aucun : texte seulement. Parité 250/250, tests 78 + 52 OK |
 
 ## 9. Empreintes (preuve que rien n'a changé)
 `python scripts/track_week_strategy.py --hashes` recalcule ces empreintes.
@@ -106,7 +107,7 @@ valide.
 
 | fichier | SHA-256 au 30/09/2026 |
 |---|---|
-| main.py | `b21c993139f6624a4a51f0797e9ec794814a9f030781e81ec65463f25104b784` |
+| main.py | `2186d73d54bf838e98bb35e34f4176ace69180a9b5c64a6e2bdf90d826394a54` (le 30/09 à 18h50, voir section 8 ; au départ `b21c993139f6624a4a51f0797e9ec794814a9f030781e81ec65463f25104b784`) |
 | ibkr_execution.py | `eba8f13d133a3e7c9253e8efd69a50f43f6898c05046c1aede215c737a2f1eb2` |
 | broker_hooks.py | `b5dd0f68338d3541bc67bd0369832673b2a455c349dcab0e96546094d545649e` |
 | .env.ibkr_paper | `9ac8b917f833913f1ab21e9aff472bbfb11a0de3e85bf0fc54d11912e55ab3ec` |

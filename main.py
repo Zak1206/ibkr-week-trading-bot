@@ -1231,6 +1231,11 @@ def breakout_buffer_pct() -> float:
         return 0.15
 
 
+def scan_bar_label() -> str:
+    """Intervalle des bougies de scan, pour les textes de log et de justification."""
+    return os.getenv("YF_INTERVAL", "15m").strip() or "15m"
+
+
 def analysis_breakout_active(analysis: Dict[str, str]) -> bool:
     return str(analysis.get("breakout_active", "0")).strip().lower() in {"1", "true", "yes", "y"}
 
@@ -1283,7 +1288,7 @@ def breakout_fundamental_exception_ok(
     fundamental_min_score: int,
 ) -> Tuple[bool, str]:
     """
-    Autorise un ACHETER malgre fonda sous le seuil si breakout 15m haussier confirme.
+    Autorise un ACHETER malgre fonda sous le seuil si breakout haussier confirme.
   """
     if not breakout_fund_exception_enabled():
         return False, ""
@@ -1307,7 +1312,7 @@ def breakout_fundamental_exception_ok(
         return False, ""
     return (
         True,
-        f"breakout 15m + MTF {ht_score} (fonda {fund_score} >= plancher exception {min_exc})",
+        f"breakout {scan_bar_label()} + MTF {ht_score} (fonda {fund_score} >= plancher exception {min_exc})",
     )
 
 
@@ -1353,7 +1358,7 @@ def effective_scan_interval_min() -> int:
 
 
 def compute_intraday_breakout_metrics(df: "pd.DataFrame") -> tuple[bool, float]:
-    """Casse du plus haut des N bougies precedentes (15m par defaut)."""
+    """Casse du plus haut des N bougies precedentes (intervalle YF_INTERVAL)."""
     lookback = breakout_lookback_bars()
     buffer_pct = breakout_buffer_pct()
     vol_ratio_min = breakout_require_volume_ratio()
@@ -1478,7 +1483,7 @@ def early_entry_signal_ok(
 ) -> Tuple[bool, str]:
     """
     Autorise une entree avant le croisement MACD complet si la structure se retourne
-    (breakout 15m ou test du plus haut de range + MTF haussier).
+    (breakout ou test du plus haut de range + MTF haussier).
     """
     if not buy_early_entry_enabled() or not breakout_early_relax_macd_enabled():
         return False, ""
@@ -1497,7 +1502,7 @@ def early_entry_signal_ok(
         return False, ""
 
     if analysis_breakout_active(analysis):
-        return True, "breakout 15m + MACD en acceleration (entree anticipee)"
+        return True, f"breakout {scan_bar_label()} + MACD en acceleration (entree anticipee)"
 
     if buy_anticipate_breakout_enabled():
         range_high = float(analysis.get("breakout_range_high", 0.0) or 0.0)
@@ -1507,14 +1512,14 @@ def early_entry_signal_ok(
             near_pct = buy_anticipate_breakout_near_pct()
             if 0.0 <= dist_pct <= near_pct and ht_score >= 2:
                 return True, (
-                    f"anticipation casse range ({dist_pct:.2f}% sous high 15m {range_high:.2f}, "
+                    f"anticipation casse range ({dist_pct:.2f}% sous high {scan_bar_label()} {range_high:.2f}, "
                     "MACD en acceleration)"
                 )
     return False, ""
 
 
 def buy_chase_too_extended(analysis: Dict[str, str]) -> Tuple[bool, str]:
-    """Bloque les entrees trop loin au-dessus du plus haut de range 15m (anti chase)."""
+    """Bloque les entrees trop loin au-dessus du plus haut de range (anti chase)."""
     max_chase = buy_max_chase_from_breakout_pct()
     if max_chase <= 0:
         return False, ""
@@ -1526,7 +1531,7 @@ def buy_chase_too_extended(analysis: Dict[str, str]) -> Tuple[bool, str]:
     if ext_pct <= max_chase:
         return False, ""
     return True, (
-        f"entree trop tardive: prix +{ext_pct:.2f}% au-dessus du range 15m "
+        f"entree trop tardive: prix +{ext_pct:.2f}% au-dessus du range {scan_bar_label()} "
         f"({range_high:.2f}), max chase {max_chase:.2f}%"
     )
 
@@ -2479,20 +2484,21 @@ def sniper_entry_ok(
         return False, "risk-off actif"
     conf_min = sniper_min_confidence()
     ht_min = sniper_min_mtf_score()
+    bar = scan_bar_label()
     if sniper_breakout_required():
         if breakout_on and conf >= conf_min and macd_ok and ht_score >= ht_min:
-            return True, "breakout 15m"
-        return False, "breakout 15m requis (mode sniper strict)"
+            return True, f"breakout {bar}"
+        return False, f"breakout {bar} requis (mode sniper strict)"
     breakout_path = breakout_on and conf >= conf_min and macd_ok and ht_score >= ht_min
     if breakout_path:
-        return True, "breakout 15m"
+        return True, f"breakout {bar}"
     alt_conf = sniper_alt_min_confidence()
     alt_mtf = sniper_alt_min_mtf_score()
     if conf >= alt_conf and ht_score >= alt_mtf and macd_ok:
         return True, f"structure forte (conf>={alt_conf}, MTF>={alt_mtf})"
     if not breakout_on:
         return False, (
-            f"pas de breakout 15m ni structure "
+            f"pas de breakout {bar} ni structure "
             f"(conf>={alt_conf}, MTF>={alt_mtf}, MACD ok)"
         )
     if conf < conf_min:
@@ -13236,7 +13242,7 @@ def main() -> None:
     print(
         f"Entree anticipee: {'on' if early_on else 'off'} "
         f"(conf regles {rules_early_entry_min_conf()}+ si setup, max chase +{buy_max_chase_from_breakout_pct():.2f}% "
-        f"vs range 15m, anti-chase re-entry {reentry_block_chase_pct():.1f}% "
+        f"vs range {scan_bar_label()}, anti-chase re-entry {reentry_block_chase_pct():.1f}% "
         f"(cooldown {reentry_cooldown_hours():.0f}h)."
     )
     print(
