@@ -15,7 +15,8 @@ sorties et sur la même période ?
 - La configuration est le bloc « BREAKOUT SEMAINE » de `.env.ibkr_paper`,
   avec le code du 30/09/2026 (empreintes SHA-256 à la section 9).
 - **Stratégie** : breakout 1h sur barres clôturées, VIX < 22, stop −10 %,
-  objectif +25 %, sortie forcée après 5 séances, 1 position à la fois.
+  objectif +25 %, sortie forcée après 5 séances seulement si le latent est positif
+  (depuis le 06/10/2026, section 8), 1 position à la fois.
 - **La règle d'entrée est testée en entier**, avec tous ses filtres : breakout,
   VIX < 22, tendance journalière, blocage autour des résultats, garde-fous.
   Les bots aléatoires n'appliquent **aucun** de ces filtres (section 4).
@@ -40,7 +41,8 @@ sorties et sur la même période ?
   période, sans aucun filtre (ni VIX, ni tendance, ni breakout).
 - **Rendement de chaque entrée possible** : un trade entré à l'ouverture de
   la barre, avec les mêmes sorties (stop −10 %, objectif +25 %, sortie après
-  5 séances) et les mêmes coûts que le moteur de backtest (0,35 $ minimum par
+  5 séances seulement si la clôture est au-dessus de l'entrée, depuis le 06/10/2026)
+  et les mêmes coûts que le moteur de backtest (0,35 $ minimum par
   ordre, 0,0035 $ par action, 3 bps de spread, une position de 1000 $). Une
   entrée dont le trade n'est pas terminé à la date de l'examen est exclue.
 - **Chaque bot tire exactement N entrées** au hasard parmi toutes les entrées
@@ -99,6 +101,10 @@ décisions est autorisée et notée dans ce document, avec la date.
 | 30/09/2026, avant tout trade | rang retenu = min(rang du paper, rang du backtest) | neutralise l'écart d'exécution réel / simulé |
 | 30/09/2026, avant tout trade | coupe-circuit désigné par sa clé de config (50 %) | lève l'ambiguïté avec l'ancienne valeur de 35 % |
 | 30/09/2026, 18h50, avant tout trade | `main.py` : les textes de log et de justification affichent l'intervalle scanné (`YF_INTERVAL`, 1h en paper) au lieu de « 15m » écrit en dur. Empreinte `b21c9931…` → `2186d73d…` | aucun : texte seulement. Parité 250/250, tests 78 + 52 OK |
+| 06/10/2026, 21h | `TRADING_MAX_HOLD_ONLY_IF_PROFIT=1` : la sortie forcée après 5 séances ne vend que si le latent est strictement positif. En perte, à plat ou sans prix, on attend le SL −10 % ou le TP +25 % déjà posés chez IBKR. Même règle dans le suivi backtest (`research_engine.py`, `track_week_strategy.py`). | oui : une ligne en perte n'est plus coupée au bout de 5 séances. Les chiffres du rapport du 29/09 sont ceux de l'ancienne règle (sortie quel que soit le P/L). |
+| 08/10/2026 (noté le 17/10) | `ibkr_execution.py` : le port 4004 (port paper du conteneur Gateway, déploiement `deploy/oracle/`) compte comme paper dans le message de connexion au démarrage. | aucun : libellé du message seulement. |
+| 12/10/2026 | `main.py` : le message Telegram « Heartbeat cycle » inclut le PnL latent (total et par ligne), même calcul que le cockpit. Empreinte `5786e859…` → `039652d0…` (notée le 17/10). | aucun : texte seulement. |
+| 17/10/2026 | Les empreintes de la section 9 portent sur les fichiers en LF, comme dans le dépôt GitHub (`.gitattributes`). Celles de `ibkr_execution.py`, `broker_hooks.py`, `research_engine.py` et `track_week_strategy.py` notées le 30/09 et le 06/10 avaient été calculées sur la copie locale en CRLF : même contenu, seules les fins de ligne diffèrent. Vérification : `git show 1af77d8:ibkr_execution.py \| sed 's/$/\r/' \| sha256sum` donne `eba8f13d…`. | aucun : fins de ligne seulement. |
 
 ## 9. Empreintes (preuve que rien n'a changé)
 `python scripts/track_week_strategy.py --hashes` recalcule ces empreintes.
@@ -107,13 +113,13 @@ valide.
 
 | fichier | SHA-256 au 30/09/2026 |
 |---|---|
-| main.py | `2186d73d54bf838e98bb35e34f4176ace69180a9b5c64a6e2bdf90d826394a54` (le 30/09 à 18h50, voir section 8 ; au départ `b21c993139f6624a4a51f0797e9ec794814a9f030781e81ec65463f25104b784`) |
-| ibkr_execution.py | `eba8f13d133a3e7c9253e8efd69a50f43f6898c05046c1aede215c737a2f1eb2` |
-| broker_hooks.py | `b5dd0f68338d3541bc67bd0369832673b2a455c349dcab0e96546094d545649e` |
-| .env.ibkr_paper | `9ac8b917f833913f1ab21e9aff472bbfb11a0de3e85bf0fc54d11912e55ab3ec` |
-| scripts/research_engine.py | `62578c9a0aba7f43ffe554546921fed07d1d2778e16bc0cb51d8ad7291b9b588` |
+| main.py | `039652d06106cdc4dd65c067eef7a1716d18580dbdaf1f2a513ff3d3ff0a8a9c` (le 12/10, voir section 8 ; au 06/10 `5786e8598dac5e97778512731734c8c745f70b3e8e475a8f22a7e423f35d937a` ; au 30/09 18h50 `2186d73d54bf838e98bb35e34f4176ace69180a9b5c64a6e2bdf90d826394a54`) |
+| ibkr_execution.py | `81a0828f595837a655177e32f10db967bb94ce9e8ac5401c1224e5bde1135cb2` (le 08/10, voir section 8 ; au 30/09 `eba8f13d133a3e7c9253e8efd69a50f43f6898c05046c1aede215c737a2f1eb2` en CRLF) |
+| broker_hooks.py | `f8f4124b8fe3ce8f7014a8222d17fdc6d55b44fab3e045ca7491705b1a61c151` (inchangé depuis le 30/09 ; `b5dd0f68338d3541bc67bd0369832673b2a455c349dcab0e96546094d545649e` en CRLF) |
+| .env.ibkr_paper | `b663a82fe1f21f1024c579f8b607966e7b25c524b4285f2f666a4239563fe34a` (le 06/10 ; au 30/09 `9ac8b917f833913f1ab21e9aff472bbfb11a0de3e85bf0fc54d11912e55ab3ec`) |
+| scripts/research_engine.py | `ec5b166e2f38af4947b1910c326e5a39858da3184b18097a6448f5ab383f296f` (le 06/10 ; en CRLF `64d0f5e4131b0d4a1013202091b2005644b5fa011fce6145719a186d681ce1b4` ; au 30/09 `62578c9a0aba7f43ffe554546921fed07d1d2778e16bc0cb51d8ad7291b9b588` en CRLF) |
 | scripts/backtest_swing.py | `b18546626bdccfe56469a7f863e78d0717443dd54c2272b56f158530755e7934` |
-| scripts/track_week_strategy.py | `958a343f6ca5d534043d8860ff97c14fc1a249d9e5db79f6c9a8ec6fa0e3edfb` |
+| scripts/track_week_strategy.py | `feb952c63328c1f877af05a551db97bd16214b2ceea6abea89589d0388e476bf` (le 06/10 ; en CRLF `db9bce7a8094f4545c6de45edc8945cdf23ca3f77e534bc9f56689e27def204f` ; au 30/09 `958a343f6ca5d534043d8860ff97c14fc1a249d9e5db79f6c9a8ec6fa0e3edfb` en CRLF) |
 
 L'empreinte de ce document est enregistrée dans la ligne du 30/09/2026 de
 `scripts/track_log.jsonl`. Un document ne peut pas contenir sa propre

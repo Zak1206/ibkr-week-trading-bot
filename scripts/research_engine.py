@@ -52,6 +52,8 @@ class Exit:
     flat_min_profit: Optional[float] = None
     eod: bool = False
     max_hold_tdays: Optional[int] = None
+    # True: la sortie duree max ne se fait que si la cloture est au-dessus du prix d'entree.
+    max_hold_only_if_profit: bool = False
     use_signal_stop: bool = False
     exit_flag: bool = False
     flag_next_open: bool = False
@@ -263,7 +265,8 @@ def simulate(bars: Bars, sig: pd.DataFrame, ex: Exit, *, budget: float = 1000.0,
                 exit_px, reason = cl, "EOD"
             if exit_px is None and ex.max_hold_tdays is not None and lod:
                 if bars.dayidx[tk][i] - p["entry_day"] >= ex.max_hold_tdays:
-                    exit_px, reason = cl, "TIME"
+                    if not (ex.max_hold_only_if_profit and cl <= p["entry"]):
+                        exit_px, reason = cl, "TIME"
             if exit_px is not None:
                 close_position(tk, exit_px, t, reason, i)
         # 4) ordres au close (MOC): geres a partir de la barre suivante

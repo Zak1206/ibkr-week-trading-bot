@@ -2896,6 +2896,49 @@ def build_portfolio_snapshot(
     return "\n".join(lines)
 
 
+def format_heartbeat_latent_pnl(positions: Dict[str, Dict[str, object]]) -> str:
+    """PnL latent des lignes ouvertes, meme calcul que le cockpit."""
+    open_tickers = list_open_tickers(positions)
+    if not open_tickers:
+        return "PnL latent: 0.00 USD (aucune position)"
+    rows: List[Dict[str, object]] = []
+    detail: List[str] = []
+    deployed = 0.0
+    for tk in open_tickers:
+        st = normalize_position_state(positions.get(tk, {}))
+        try:
+            entry = float(st.get("entry_price_usd", 0.0) or 0.0)
+            notional = float(st.get("entry_notional_usd", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            entry, notional = 0.0, 0.0
+        px = get_reference_price_usd(tk) if entry > 0 else None
+        if px is None or entry <= 0:
+            detail.append(f"- {tk}: px live indisponible")
+            continue
+        metrics = _cockpit_row_price_metrics(
+            px=float(px),
+            entry=entry,
+            notional=notional,
+            sl=None,
+            tp=None,
+        )
+        rows.append(metrics)
+        if notional > 0:
+            deployed += notional
+        detail.append(
+            f"- {tk}: {float(metrics['pnl_usd']):+.2f} USD ({float(metrics['pnl_pct']):+.2f}%)"
+        )
+    unrealized_usd, unrealized_pct = _cockpit_unrealized_totals(rows, deployed_usd=deployed)
+    if unrealized_usd is None:
+        head = "PnL latent: indisponible (prix live manquants)"
+    else:
+        pct_txt = f" ({float(unrealized_pct):+.2f}%)" if unrealized_pct is not None else ""
+        head = f"PnL latent: {float(unrealized_usd):+.2f} USD{pct_txt}"
+    if not detail:
+        return head
+    return head + "\n" + "\n".join(detail)
+
+
 def _cockpit_unrealized_totals(
     pos_rows: List[Dict[str, object]],
     *,
@@ -4839,6 +4882,25 @@ def max_hold_min_before_close() -> float:
         return 30.0
 
 
+def max_hold_only_if_profit() -> bool:
+    """1 = la sortie duree max ne vend pas une ligne en perte ou a plat."""
+    return _env_on("TRADING_MAX_HOLD_ONLY_IF_PROFIT", "0")
+
+
+def max_hold_latent_in_profit(ticker: str, state: Dict[str, object]) -> Optional[bool]:
+    """
+    True si le prix actuel est strictement au-dessus du prix d'entree.
+    False sinon. None si l'entree ou le prix est inconnu : on ne vend pas.
+    """
+    entry = float(state.get("entry_price_usd", 0.0) or 0.0)
+    if entry <= 0:
+        return None
+    px = get_reference_price_usd(ticker)
+    if px is None or float(px) <= 0:
+        return None
+    return float(px) > entry
+
+
 def sessions_held(entry_ts_utc: str, now: Optional[datetime] = None) -> Optional[int]:
     """
     Seances de bourse ecoulees depuis le jour d'entree, jour courant inclus,
@@ -4874,8 +4936,9 @@ def maybe_max_hold_exit_positions(
 ) -> int:
     """
     Vend au marche, dans les dernieres minutes de seance, les lignes detenues depuis
-    >= TRADING_MAX_HOLD_SESSIONS seances, quel que soit le P/L. attempt_ibkr_sell annule
-    le bracket SL/TP avant de vendre et le restaure si la vente echoue.
+    >= TRADING_MAX_HOLD_SESSIONS seances. Si TRADING_MAX_HOLD_ONLY_IF_PROFIT=1, une ligne
+    en perte, a plat ou sans prix connu n'est pas vendue : le SL/TP chez IBKR reste la sortie.
+    attempt_ibkr_sell annule le bracket SL/TP avant de vendre et le restaure si la vente echoue.
     En cas d'echec on retente dans la fenetre (pas de pending_sell collant).
     """
     n_max = max_hold_sessions()
@@ -4901,6 +4964,16 @@ def maybe_max_hold_exit_positions(
             continue
         if held < n_max:
             continue
+        if max_hold_only_if_profit():
+            in_profit = max_hold_latent_in_profit(ticker, st)
+            if in_profit is not True:
+                if not bool(st.get("max_hold_loss_skip_logged")):
+                    st["max_hold_loss_skip_logged"] = True
+                    positions[ticker] = st
+                    save_positions(position_file, positions)
+                    why = "prix inconnu" if in_profit is None else "latent pas en gain"
+                    print(f"[MAX_HOLD] {ticker}: {held} seance(s) >= {n_max} mais {why} — pas de vente a perte.")
+                continue
         last_try = float(st.get("last_max_hold_try_ts", 0.0) or 0.0)
         if time.time() - last_try < retry_sec:
             continue
@@ -13536,12 +13609,14 @@ def main() -> None:
                     max_open_positions=hb_slots,
                     journal_file=journal_file_show,
                 )
+                latent = format_heartbeat_latent_pnl(hb_positions)
                 hb_msg = (
                     f"Heartbeat cycle #{cycle_idx} ({now_ny_txt})\n"
                     f"Scans tickers: {stats.get('scanned', 0)}\n"
                     f"Duree cycle: {elapsed:.1f}s\n"
                     f"Signaux envoyes: {stats.get('signals_sent', 0)} "
-                    f"(BUY {stats.get('buy_sent', 0)} / SELL {stats.get('sell_sent', 0)})\n\n"
+                    f"(BUY {stats.get('buy_sent', 0)} / SELL {stats.get('sell_sent', 0)})\n"
+                    f"{latent}\n\n"
                     f"{snapshot}"
                 )
                 try:

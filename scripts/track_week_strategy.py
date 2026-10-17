@@ -93,9 +93,10 @@ def paper_trades(journal, since):
     return sorted(out, key=lambda t: t["exit_ts"])
 
 
-def random_trade_net(o, h, l, c, dayidx, lod, j, stop_pct, tp_pct, hold):
+def random_trade_net(o, h, l, c, dayidx, lod, j, stop_pct, tp_pct, hold, only_if_profit=False):
     """Rendement NET d'un trade entre a l'ouverture de la barre j, sorties de la strategie
     (stop, objectif, `hold` seances), couts du moteur (0.35$ min/ordre, 0.0035$/action, 3 bps).
+    only_if_profit: la sortie duree max ne se fait que si la cloture est au-dessus de l'entree.
     None si le trade n'est pas termine a la derniere barre disponible."""
     hs = 1.5e-4
     entry = o[j] * (1 + hs)
@@ -108,7 +109,7 @@ def random_trade_net(o, h, l, c, dayidx, lod, j, stop_pct, tp_pct, hold):
             exit_px = min(slp, o[k]); break
         if h[k] >= tpp:
             exit_px = max(tpp, o[k]); break
-        if lod[k] and dayidx[k] - d0 >= hold:
+        if lod[k] and dayidx[k] - d0 >= hold and not (only_if_profit and c[k] <= entry):
             exit_px = c[k]; break
     if exit_px is None:
         return None
@@ -171,7 +172,12 @@ def main():
     sig = sig[sig["breakout"]].reset_index(drop=True)
     sig["kind"], sig["prio"] = "open", 0.0
     bars = E.Bars(data["h1"])
-    ex = E.Exit("week", sl_pct=stop, tp_pct=tp, max_hold_tdays=hold)
+    only_profit = str(env.get("TRADING_MAX_HOLD_ONLY_IF_PROFIT") or "0").strip().lower() in {
+        "1", "true", "yes", "y",
+    }
+    ex = E.Exit(
+        "week", sl_pct=stop, tp_pct=tp, max_hold_tdays=hold, max_hold_only_if_profit=only_profit,
+    )
     win = (pd.Timestamp(since).tz_localize(NY), bars.all_ts[-1])
     kw = dict(win=win, line_usd=1000.0, max_open=1, budget=1000.0)
     bt = E.simulate(bars, sig, ex, **kw)["trades"]
@@ -207,7 +213,7 @@ def main():
         dayidx, _ = pd.factorize(h.index.normalize())
         lod = np.r_[dayidx[1:] != dayidx[:-1], True]
         for j in np.where(h.index >= win[0])[0]:
-            r = random_trade_net(o, hi_, lo_, c, dayidx, lod, int(j), stop, tp, hold)
+            r = random_trade_net(o, hi_, lo_, c, dayidx, lod, int(j), stop, tp, hold, only_profit)
             if r is not None:
                 pool.append(r)
     pool = np.array(pool)

@@ -114,6 +114,39 @@ def test_max_hold_exit():
             M.maybe_max_hold_exit_positions(positions, pos_file, journal_file="", journal_enabled=False,
                                             bot_token="", chat_id="", now=ny(2026, 9, 28, 13, 0))
             check("hors fenetre: aucune vente", len(calls) == 0)
+
+        orig_px = M.get_reference_price_usd
+        try:
+            with with_env({"TRADING_MAX_HOLD_SESSIONS": "5", "TRADING_MAX_HOLD_RETRY_SEC": "20",
+                           "TRADING_MAX_HOLD_ONLY_IF_PROFIT": "1"}):
+                now = ny(2026, 9, 28, 15, 40)
+                calls.clear()
+                positions = {"HOOD": state(ny(2026, 9, 21, 10, 35))}
+                M.get_reference_price_usd = lambda ticker: 19.0
+                n = M.maybe_max_hold_exit_positions(positions, pos_file, journal_file="", journal_enabled=False,
+                                                    bot_token="", chat_id="", now=now)
+                check("en perte: pas de vente", n == 0 and len(calls) == 0 and "HOOD" in positions)
+                calls.clear()
+                positions = {"HOOD": state(ny(2026, 9, 21, 10, 35))}
+                M.get_reference_price_usd = lambda ticker: 20.0
+                n = M.maybe_max_hold_exit_positions(positions, pos_file, journal_file="", journal_enabled=False,
+                                                    bot_token="", chat_id="", now=now)
+                check("a plat: pas de vente", n == 0 and len(calls) == 0)
+                calls.clear()
+                positions = {"HOOD": state(ny(2026, 9, 21, 10, 35))}
+                M.get_reference_price_usd = lambda ticker: None
+                n = M.maybe_max_hold_exit_positions(positions, pos_file, journal_file="", journal_enabled=False,
+                                                    bot_token="", chat_id="", now=now)
+                check("prix inconnu: pas de vente", n == 0 and len(calls) == 0)
+                calls.clear()
+                fake_sell.ok = True
+                positions = {"HOOD": state(ny(2026, 9, 21, 10, 35))}
+                M.get_reference_price_usd = lambda ticker: 21.0
+                n = M.maybe_max_hold_exit_positions(positions, pos_file, journal_file="", journal_enabled=False,
+                                                    bot_token="", chat_id="", now=now)
+                check("en gain: vente", n == 1 and calls and calls[0]["exit_reason"] == "max_hold_sessions")
+        finally:
+            M.get_reference_price_usd = orig_px
     finally:
         M.attempt_ibkr_sell, M.ibkr_auto_execute_enabled = orig_sell, orig_auto
 
@@ -244,6 +277,7 @@ def test_paper_profile_consistency():
           and env.get("TRAILING_TP_ENABLED") == "0" and env.get("TRADING_SWAP_ON_FULL_SLOTS") == "0"
           and env.get("TRADING_SWAP_ON_BUDGET") == "0")
     check("sortie 5 seances", int(g("TRADING_MAX_HOLD_SESSIONS")) == 5)
+    check("sortie 5 seances seulement si latent en gain", env.get("TRADING_MAX_HOLD_ONLY_IF_PROFIT") == "1")
     check("barres cloturees (scan + MTF)", env.get("SCAN_COMPLETED_BARS_ONLY") == "1"
           and env.get("MTF_COMPLETED_BARS_ONLY") == "1")
     check("MTF journaliere sur >= 80 bougies (1y)", env.get("MTF_INTERVAL") == "1d" and env.get("MTF_PERIOD") == "1y")
