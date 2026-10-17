@@ -1,0 +1,51 @@
+# Bot + IB Gateway (paper) sur une VM Oracle Cloud Always Free (Ampere A1, arm64).
+# Lancer depuis ce dossier : docker compose up -d --build
+# Secrets Gateway : deploy/oracle/.env (copie de gateway.env.example, gitignore).
+
+services:
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    restart: unless-stopped
+    environment:
+      TWS_USERID: ${TWS_USERID}
+      TWS_PASSWORD: ${TWS_PASSWORD}
+      TRADING_MODE: paper
+      TWS_MASTER_CLIENT_ID: "8"
+      READ_ONLY_API: "no"
+      BYPASS_WARNING: "yes"
+      AUTO_RESTART_TIME: "11:45 PM"
+      TWOFA_TIMEOUT_ACTION: restart
+      RELOGIN_AFTER_TWOFA_TIMEOUT: "yes"
+      TIME_ZONE: Europe/Paris
+      TZ: Europe/Paris
+      VNC_SERVER_PASSWORD: ${VNC_SERVER_PASSWORD:-}
+      TWS_SETTINGS_PATH: /home/ibgateway/tws_settings
+    volumes:
+      - gateway_settings:/home/ibgateway/tws_settings
+    ports:
+      # Bot et Gateway partagent le meme reseau : seuls le cockpit et VNC sortent,
+      # et uniquement sur le loopback de la VM (acces par tunnel SSH).
+      - "127.0.0.1:8765:8765"
+      - "127.0.0.1:5900:5900"
+
+  bot:
+    build:
+      context: ../..
+      dockerfile: deploy/oracle/Dockerfile.bot
+    restart: unless-stopped
+    network_mode: "service:ib-gateway"
+    depends_on:
+      - ib-gateway
+    environment:
+      TZ: Europe/Paris
+      BOT_PROFILE: .env.ibkr_paper
+    volumes:
+      - ../..:/app
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+volumes:
+  gateway_settings:

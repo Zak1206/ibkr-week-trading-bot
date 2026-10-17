@@ -1,0 +1,3 @@
+# L'image du bot n'a besoin que des dependances ; le code et les secrets arrivent par volume.
+*
+!requirements.txt

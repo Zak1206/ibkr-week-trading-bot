@@ -37,6 +37,7 @@ docs/projet-bot-resume.md
 .playwright-mcp/
 *.lock
 *.log
+deploy/oracle/.gateway_watch.state
 
 # --- Caches et sorties de recherche (donnees Yahoo / FINRA: non redistribuables, volumineuses) ---
 *.pkl

@@ -1,0 +1,15 @@
+FROM python:3.12-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONIOENCODING=utf-8
+
+# Le code et l'etat (positions.json, journal) viennent du volume /app, pas de l'image.
+CMD ["sh", "/app/deploy/oracle/entrypoint.sh"]

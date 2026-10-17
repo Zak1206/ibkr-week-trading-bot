@@ -2363,7 +2363,8 @@ def connect_ibkr_at_startup() -> Optional[str]:
     session.connect()
     acct = session.account_label()
     port = _env_int("IBKR_PORT", 4002)
-    paper = port in {4002, 7497}
+    # 4004 = port paper publie par socat dans le conteneur Gateway.
+    paper = port in {4002, 4004, 7497}
     mode = "paper" if paper else "live"
     cid = ibkr_our_client_id()
     return (

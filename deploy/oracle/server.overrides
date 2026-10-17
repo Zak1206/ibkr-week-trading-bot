@@ -1,0 +1,10 @@
+# Surcharges propres au serveur Oracle, ajoutees apres .env.ibkr_paper.
+# Rien de la strategie ici : uniquement le reseau du conteneur.
+
+# Le cockpit doit ecouter sur l'interface du conteneur pour etre publie ;
+# docker-compose ne le publie que sur 127.0.0.1 de la VM.
+COCKPIT_WEB_HOST=0.0.0.0
+COCKPIT_WEB_PORT=8765
+# Dans le conteneur, Gateway ecoute en interne sur 4002 (IPv6 seulement).
+# Le port joignable en IPv4, celui que le bot utilise, est 4004.
+IBKR_PORT=4004
