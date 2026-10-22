@@ -4,6 +4,9 @@
 # On relance le conteneur : login avec le mot de passe, puis le bot.
 # Un redemarrage sain dure ~20 s. On n'agit qu'apres 3 minutes coupes,
 # et au plus 2 fois par heure.
+# Si Docker relance seul le conteneur Gateway, le bot (network_mode
+# service:ib-gateway) reste dans l'ancien reseau : ni DNS ni port 4004.
+# On redemarre alors le bot, ce qui le rattache au reseau de la Gateway.
 set -eu
 
 DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
@@ -30,6 +33,16 @@ port_up() {
     docker exec oracle-ib-gateway-1 bash -c 'echo >/dev/tcp/127.0.0.1/4002' >/dev/null 2>&1
 }
 
+bot_running() {
+    [ "$(docker inspect -f '{{.State.Running}}' oracle-bot-1 2>/dev/null)" = "true" ]
+}
+
+# Meme port 4004, vu depuis chaque conteneur : une difference = reseaux separes.
+bot_cut_off() {
+    docker exec oracle-ib-gateway-1 bash -c 'echo >/dev/tcp/127.0.0.1/4004' >/dev/null 2>&1 \
+        && ! docker exec oracle-bot-1 python -c "import socket; socket.create_connection(('127.0.0.1', 4004), 2).close()" >/dev/null 2>&1
+}
+
 write_state() {
     cat > "$STATE" <<EOF
 FAILS=$FAILS
@@ -41,6 +54,12 @@ EOF
 
 if port_up; then
     FAILS=0
+    if bot_running && bot_cut_off; then
+        echo "$(date '+%F %T') bot coupe du reseau Gateway, redemarrage du bot" >> "$LOG"
+        cd "$DIR"
+        docker compose restart bot >> "$LOG" 2>&1 || true
+        LAST_RESTART=$now
+    fi
     write_state
     exit 0
 fi
