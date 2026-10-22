@@ -64,9 +64,11 @@ def main():
         try:
             raw = M.normalize_ohlc_columns(M.fetch_price_data(tk, period=per, interval=iv), tk)
             an = M.analyze_ticker(tk, per, iv)
-            ht = M.get_higher_tf_context(tk, period=mper, interval=miv)
+            bar_date = (an or {}).get("bar_date")
+            ht = M.get_higher_tf_context(tk, period=mper, interval=miv, before_date=bar_date)
             fd = M.fetch_fundamental_data(ticker=tk, cache=cache, cache_hours=24)
-            fd["risk_off"] = risk_off
+            fd["risk_off"] = M.get_market_regime_risk_off(
+                float(os.environ.get("RISK_OFF_VIX_THRESHOLD", "22")), before_date=bar_date)
             parsed, tag = M.build_rules_scan_decision(ticker=tk, analysis=an or {}, state={},
                                                       higher_tf=ht, fund_data=fd)
         except Exception as exc:  # noqa: BLE001

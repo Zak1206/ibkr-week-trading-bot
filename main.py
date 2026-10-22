@@ -4353,6 +4353,11 @@ def block_buy_min_before_close_minutes() -> float:
         return 0.0
 
 
+def is_after_us_close(now: Optional[datetime] = None) -> bool:
+    """True a partir de 16h00 NY: un ordre au marche DAY serait rejete (Error 201, bourse fermee)."""
+    return minutes_until_us_market_close(now) <= 0
+
+
 def is_buy_blocked_near_close(now: Optional[datetime] = None) -> Tuple[bool, float]:
     """True si nouvelles entrees / switch bloques en fin de seance. Retourne (bloque, mins_restantes)."""
     mins_left = minutes_until_us_market_close(now)
@@ -5074,6 +5079,20 @@ def drop_forming_bar(df: pd.DataFrame, interval: str, now: Optional[datetime] = 
     if end > pd.Timestamp(now_ny):
         return df.iloc[:-1]
     return df
+
+
+def keep_days_before(df: pd.DataFrame, before_date: str) -> pd.DataFrame:
+    """
+    Garde les bougies journalieres des seances AVANT `before_date` (YYYY-MM-DD, NY).
+    Regle du backtest: le contexte journalier (tendance, VIX) d'une barre 1h est celui
+    de la veille du jour de cette barre, qu'on la lise a 16h ou le lendemain matin.
+    """
+    if df is None or len(df) == 0 or not before_date:
+        return df
+    idx = pd.DatetimeIndex(df.index)
+    days = idx.tz_convert(MARKET_TZ).date if idx.tz is not None else idx.date
+    cut = pd.Timestamp(before_date).date()
+    return df[[d < cut for d in days]]
 
 
 def count_recent_day_trades(journal_file: str, now: Optional[datetime] = None, window_days: int = 5) -> int:
@@ -7248,11 +7267,13 @@ def fetch_fundamental_data(
     return payload
 
 
-def get_market_regime_risk_off(vix_threshold: float = 22.0) -> bool:
-    """True si regime risk-off (proxy VIX)."""
+def get_market_regime_risk_off(vix_threshold: float = 22.0, before_date: Optional[str] = None) -> bool:
+    """True si regime risk-off (proxy VIX). Avec before_date: VIX de la veille du jour de la barre."""
     try:
         vix = fetch_price_data("^VIX", period="5d", interval="1d")
         vix = normalize_ohlc_columns(vix, "^VIX")
+        if before_date:
+            vix = keep_days_before(vix, before_date)
         if vix.empty:
             return False
         close_series = vix["Close"]
@@ -7264,10 +7285,14 @@ def get_market_regime_risk_off(vix_threshold: float = 22.0) -> bool:
         return False
 
 
-def get_higher_tf_context(ticker: str, period: str = "3mo", interval: str = "1h") -> Dict[str, object]:
+def get_higher_tf_context(
+    ticker: str, period: str = "3mo", interval: str = "1h", before_date: Optional[str] = None
+) -> Dict[str, object]:
     """
     Contexte tendance timeframe superieur (gratuit).
     trend_score: -2 (baissier) ... +2 (haussier)
+    before_date (YYYY-MM-DD NY): jour de la barre du signal; en journalier, seules les
+    seances d'avant comptent (regle du backtest).
     """
     out: Dict[str, object] = {
         "trend_score": 0,
@@ -7280,9 +7305,15 @@ def get_higher_tf_context(ticker: str, period: str = "3mo", interval: str = "1h"
     try:
         raw = fetch_price_data(ticker, period=period, interval=interval)
         raw = normalize_ohlc_columns(raw, ticker)
+        # Yahoo renvoie parfois la bougie du jour sans cloture: elle fausserait les 3 criteres
+        raw = raw.dropna(subset=["Close"])
         if _env_on("MTF_COMPLETED_BARS_ONLY"):
-            # la tendance journaliere du backtest est celle de la cloture de la VEILLE
-            raw = drop_forming_bar(raw, interval)
+            # la tendance journaliere du backtest est celle de la cloture de la VEILLE du jour
+            # de la barre: a 16h ou le lendemain avant 10h30, la barre lue est celle de 15h30
+            if before_date and interval.strip().lower() == "1d":
+                raw = keep_days_before(raw, before_date)
+            else:
+                raw = drop_forming_bar(raw, interval)
         if len(raw) < 80:
             return out
         close = raw["Close"].astype(float)
@@ -10181,9 +10212,12 @@ def analyze_ticker(ticker: str, period: str, interval: str) -> Optional[Dict[str
     bb_pos = bollinger_position(last)
     breakout_active, range_high = compute_intraday_breakout_metrics(df)
     news = get_latest_news(ticker, limit=5)
+    bar_ts = pd.Timestamp(df.index[-1])
+    bar_ts = bar_ts.tz_localize(MARKET_TZ) if bar_ts.tzinfo is None else bar_ts.tz_convert(MARKET_TZ)
 
     return {
         "ticker": ticker,
+        "bar_date": bar_ts.date().isoformat(),
         "current_price": f"{current_price}",
         "atr": f"{atr}",
         "rsi": f"{rsi}",
@@ -11598,6 +11632,18 @@ def run_premarket_preparation(
         return False
 
 
+def _scan_risk_off(ctx: Dict[str, Any], bar_date: str) -> bool:
+    """VIX de la veille du jour de la barre du signal (regle du backtest), lu une fois par date."""
+    if not bar_date or "risk_off_by_date" not in ctx:
+        return bool(ctx["risk_off_regime"])
+    cache = ctx["risk_off_by_date"]
+    if bar_date not in cache:
+        cache[bar_date] = get_market_regime_risk_off(
+            vix_threshold=ctx["risk_off_vix_threshold"], before_date=bar_date
+        )
+    return bool(cache[bar_date])
+
+
 def _scan_ticker_llm_worker(ticker: str, ctx: Dict[str, Any]) -> Tuple[str, Optional[Dict[str, Any]]]:
     """Phase lecture + LLM (thread-safe). Pas d'ordre IBKR ni mutation positions."""
     try:
@@ -11629,13 +11675,14 @@ def _scan_ticker_llm_worker(ticker: str, ctx: Dict[str, Any]) -> Tuple[str, Opti
                     cache=ctx["fundamental_cache"],
                     cache_hours=ctx["fundamental_cache_hours"],
                 )
-            fund_data["risk_off"] = ctx["risk_off_regime"]
+            fund_data["risk_off"] = _scan_risk_off(ctx, str(analysis.get("bar_date") or ""))
         fund_score_val = int(fund_data.get("fund_score", 50))
         higher_tf = (
             get_higher_tf_context(
                 ticker=ticker,
                 period=ctx["mtf_period"],
                 interval=ctx["mtf_interval"],
+                before_date=str(analysis.get("bar_date") or "") or None,
             )
             if ctx["mtf_enabled"]
             else {"trend_score": 0, "summary": "Desactive", "interval": ctx["mtf_interval"]}
@@ -12293,6 +12340,8 @@ def run_cycle() -> Dict[str, int]:
         "fundamental_cache": fundamental_cache,
         "fundamental_cache_hours": fundamental_cache_hours,
         "risk_off_regime": risk_off_regime,
+        "risk_off_vix_threshold": risk_off_vix_threshold,
+        "risk_off_by_date": {},
         "mtf_enabled": mtf_enabled,
         "mtf_period": mtf_period,
         "mtf_interval": mtf_interval,
@@ -12427,6 +12476,12 @@ def run_cycle() -> Dict[str, int]:
             print(f"[{ticker}] MTF: {higher_tf.get('summary', 'Indisponible')}")
 
         if decision == "ACHETER":
+            if is_after_us_close():
+                print(
+                    f"[{ticker}] Decision ACHETER reportee: bourse fermee (16h00 NY passe). "
+                    f"La barre sera relue au premier scan de la seance suivante (entree a l'ouverture, comme le backtest)."
+                )
+                continue
             buy_blocked_near_close, mins_to_close = is_buy_blocked_near_close()
             if buy_blocked_near_close:
                 print(

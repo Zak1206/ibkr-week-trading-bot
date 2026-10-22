@@ -403,6 +403,94 @@ def test_line_steps():
             check("sans paliers: couloir 900-1100$", abs(lo0 - 900) < 1e-6 and abs(hi0 - 1100) < 1e-6)
 
 
+def _daily_trend_frame(end, crash_last=False, nan_extra=None):
+    """120 seances en hausse reguliere (tendance +2); option: krach sur la derniere
+    (tendance negative si elle est lue) ou ligne en plus avec cloture vide (Yahoo)."""
+    import numpy as np
+    idx = pd.bdate_range(end=end, periods=120)
+    close = 100.0 * 1.01 ** np.arange(120)
+    if crash_last:
+        close[-1] = close[-2] * 0.5
+    df = pd.DataFrame({"Open": close, "High": close * 1.01, "Low": close * 0.99, "Close": close,
+                       "Volume": 1e6}, index=idx)
+    if nan_extra:
+        df.loc[pd.Timestamp(nan_extra)] = [df["Close"].iloc[-1], df["Close"].iloc[-1] * 1.01,
+                                           df["Close"].iloc[-1] * 0.99, float("nan"), 1e6]
+    return df
+
+
+def _hourly_frame(last_day, utc=False):
+    import numpy as np
+    days = pd.bdate_range(end=last_day, periods=15)
+    idx = [pd.Timestamp("%s %s" % (d.date(), hm), tz=NY) for d in days
+           for hm in ("09:30", "10:30", "11:30", "12:30", "13:30", "14:30", "15:30")]
+    idx = pd.DatetimeIndex(idx)
+    if utc:
+        idx = idx.tz_convert("UTC")
+    close = 50.0 + np.sin(np.arange(len(idx)) / 3.0)
+    return pd.DataFrame({"Open": close, "High": close + 0.3, "Low": close - 0.3, "Close": close,
+                         "Volume": 1e5}, index=idx)
+
+
+def test_daily_context_before_signal_bar():
+    print("\n[12] contexte journalier (tendance, VIX) = seances closes AVANT le jour de la barre du signal")
+    import threading
+    feed = {}
+    saved = (M.fetch_price_data, M.get_latest_news, M.fetch_fundamental_data,
+             M.reconcile_analysis_price_usd, M.quick_momentum_score_for_ticker)
+    M.fetch_price_data = lambda ticker, period="5d", interval="15m", **k: feed[(ticker, interval)].copy()
+    M.get_latest_news = lambda *a, **k: []
+    M.fetch_fundamental_data = lambda **k: {"fund_score": 50, "earnings_days": None, "risk_off": False}
+    M.reconcile_analysis_price_usd = lambda t, p, entry_price_hint=None: p
+    M.quick_momentum_score_for_ticker = lambda t: 0.0
+    try:
+        with with_env({"MTF_COMPLETED_BARS_ONLY": "1", "SCAN_COMPLETED_BARS_ONLY": "1"}):
+            feed[("TST", "1h")] = _hourly_frame("2026-09-25")
+            an = M.analyze_ticker("TST", "3mo", "1h")
+            check("analyze_ticker: date NY de la barre du signal", an and an.get("bar_date") == "2026-09-25",
+                  f"bar_date={an and an.get('bar_date')}")
+            feed[("TST", "1h")] = _hourly_frame("2026-09-25", utc=True)
+            an = M.analyze_ticker("TST", "3mo", "1h")
+            check("analyze_ticker: index UTC -> date NY", an and an.get("bar_date") == "2026-09-25")
+
+            feed[("TST", "1d")] = _daily_trend_frame("2026-09-25", crash_last=True)
+            ht = M.get_higher_tf_context("TST", period="1y", interval="1d", before_date="2026-09-25")
+            check("tendance: bougie du jour de la barre exclue (+2)", ht["trend_score"] == 2, f"{ht['trend_score']}")
+            ht = M.get_higher_tf_context("TST", period="1y", interval="1d")
+            check("tendance sans date: derniere bougie close lue (krach -> < 0)", ht["trend_score"] < 0)
+            feed[("TST", "1d")] = _daily_trend_frame("2026-09-25", nan_extra="2026-09-28")
+            ht = M.get_higher_tf_context("TST", period="1y", interval="1d")
+            check("tendance: cloture vide (Yahoo) ignoree", ht["trend_score"] == 2, f"{ht['trend_score']}")
+
+            vix = pd.DataFrame({"Open": 1.0, "High": 1.0, "Low": 1.0, "Close": [15.0, 18.0, 25.0, float("nan")],
+                                "Volume": 0}, index=pd.DatetimeIndex(["2026-09-23", "2026-09-24", "2026-09-25",
+                                                                      "2026-09-28"]))
+            feed[("^VIX", "1d")] = vix
+            check("VIX: veille de la barre (18 < 22)",
+                  M.get_market_regime_risk_off(22.0, before_date="2026-09-25") is False)
+            check("VIX sans date: derniere cloture (25, vide ignoree)", M.get_market_regime_risk_off(22.0) is True)
+
+            # cablage du scan: barre 15h30 du 25/09 lue a 16h ou le lendemain matin
+            feed[("TST", "1h")] = _hourly_frame("2026-09-25")
+            feed[("TST", "1d")] = _daily_trend_frame("2026-09-25", crash_last=True)
+            ctx = {"yf_period": "3mo", "yf_interval": "1h", "positions_snapshot": {},
+                   "fundamental_enabled": True, "fundamental_cache": {}, "fundamental_cache_hours": 6,
+                   "fund_lock": threading.Lock(), "risk_off_regime": True, "risk_off_vix_threshold": 22.0,
+                   "risk_off_by_date": {}, "mtf_enabled": True, "mtf_period": "1y", "mtf_interval": "1d",
+                   "effective_budget_usd": 1000.0, "deployed_for_prompt": 0.0, "scan_decision_mode": "rules"}
+            _, res = M._scan_ticker_llm_worker("TST", ctx)
+            check("scan: tendance de la veille de la barre", res and res["higher_tf"]["trend_score"] == 2,
+                  f"{res and res['higher_tf']}")
+            check("scan: VIX de la veille de la barre", res and res["fund_data"]["risk_off"] is False)
+    finally:
+        (M.fetch_price_data, M.get_latest_news, M.fetch_fundamental_data,
+         M.reconcile_analysis_price_usd, M.quick_momentum_score_for_ticker) = saved
+
+    check("16h00:04 NY: plus d'ordre d'achat (bourse fermee)", M.is_after_us_close(datetime(2026, 9, 28, 16, 0, 4, tzinfo=NY)))
+    check("15h59 NY: achat possible", not M.is_after_us_close(ny(2026, 9, 28, 15, 59)))
+    check("9h30 NY: achat possible", not M.is_after_us_close(ny(2026, 9, 28, 9, 30)))
+
+
 def main_tests():
     test_sessions_held()
     test_max_hold_window()
@@ -415,6 +503,7 @@ def main_tests():
     test_reference_price_by_session()
     test_cockpit_summary()
     test_line_steps()
+    test_daily_context_before_signal_bar()
     import test_execution_safety as T
     print("\nResultat: %d OK / %d FAIL" % (T.PASS, T.FAIL))
     return T.FAIL

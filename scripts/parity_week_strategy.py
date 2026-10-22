@@ -65,7 +65,6 @@ def main():
     sig = B.build_signals(data)
     sig = sig[sig["breakout"]]
     sig_set = {(r.ticker, int(r.bar) - 1) for r in sig.itertuples()}  # barre du SIGNAL = entree - 1
-    vix = data["vix"]["Close"].astype(float)
 
     rng = np.random.default_rng(5)
     t_min = pd.Timestamp("2024-02-01 09:30", tz="America/New_York")
@@ -87,13 +86,18 @@ def main():
         d = data["d1"][tk]
         day = h.index[i].tz_convert("America/New_York").normalize().tz_localize(None)
         FEED[(tk, os.environ["YF_INTERVAL"])] = h.iloc[max(0, i - 439): i + 1]
-        FEED[(tk, os.environ["MTF_INTERVAL"])] = d[d.index < day].iloc[-252:]
-        v = vix[vix.index < day]
-        risk_off = bool(len(v) and float(v.iloc[-1]) >= float(os.environ["RISK_OFF_VIX_THRESHOLD"]))
+        # journalier et VIX JUSQU'AU jour de la barre inclus: c'est ce que le bot voit a 16h
+        # ou le lendemain matin pour la barre de 15h30; a lui de ne garder que la veille.
+        FEED[(tk, os.environ["MTF_INTERVAL"])] = d[d.index <= day].iloc[-253:]
+        FEED[("^VIX", "1d")] = data["vix"][data["vix"].index <= day].iloc[-5:]
         builtins.print = lambda *a, **k: None   # le pipeline est bavard
         try:
             an = M.analyze_ticker(tk, os.environ["YF_PERIOD"], os.environ["YF_INTERVAL"])
-            ht = M.get_higher_tf_context(tk, period=os.environ["MTF_PERIOD"], interval=os.environ["MTF_INTERVAL"])
+            bar_date = (an or {}).get("bar_date")
+            ht = M.get_higher_tf_context(tk, period=os.environ["MTF_PERIOD"], interval=os.environ["MTF_INTERVAL"],
+                                         before_date=bar_date)
+            risk_off = M.get_market_regime_risk_off(float(os.environ["RISK_OFF_VIX_THRESHOLD"]),
+                                                    before_date=bar_date)
             parsed, tag = M.build_rules_scan_decision(
                 ticker=tk, analysis=an or {}, state={}, higher_tf=ht,
                 fund_data={"fund_score": 50, "risk_off": risk_off, "earnings_days": None})
