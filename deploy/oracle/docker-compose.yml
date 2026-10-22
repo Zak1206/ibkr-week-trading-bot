@@ -33,6 +33,9 @@ services:
       context: ../..
       dockerfile: deploy/oracle/Dockerfile.bot
     restart: unless-stopped
+    # Arret propre: le bot finit l'ordre en cours avant de quitter (achat jusqu'a ~4 min
+    # avec MIDPRICE, attente du fill et retry). Au-dela, Docker le tue.
+    stop_grace_period: 300s
     network_mode: "service:ib-gateway"
     depends_on:
       - ib-gateway

@@ -12,6 +12,7 @@ swap_pending*.json
 telegram_offset*.json
 premarket_prep_state*.json
 fundamental_cache*.json
+scan_bar_state*.json
 
 # --- Python ---
 __pycache__/

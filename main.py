@@ -5,6 +5,8 @@ import json
 import math
 import os
 import re
+import shutil
+import signal
 import sys
 import threading
 import time
@@ -56,6 +58,79 @@ def ensure_stdio_utf8() -> None:
                 stream.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
+
+
+_SECRET_PATTERNS = (
+    (re.compile(r"bot\d{5,}:[A-Za-z0-9_-]{20,}"), "bot<TOKEN>"),
+    (re.compile(r"(?i)\b(token|apikey|api_key|key)=[^&\s'\"]+"), r"\1=<SECRET>"),
+)
+
+
+def redact_secrets(text: str) -> str:
+    """Masque les secrets (token Telegram, cles API en query string)."""
+    for pat, repl in _SECRET_PATTERNS:
+        text = pat.sub(repl, text)
+    return text
+
+
+class _RedactingStream:
+    """Enveloppe stdout/stderr: les erreurs requests affichent l'URL complete, token compris."""
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, text):
+        return self._stream.write(redact_secrets(text) if isinstance(text, str) else text)
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def install_secret_redaction() -> None:
+    """Tout ce qui part dans les logs (prints, tracebacks) passe par redact_secrets."""
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name)
+        if not isinstance(stream, _RedactingStream):
+            setattr(sys, name, _RedactingStream(stream))
+
+
+# Arret propre (docker stop / watchdog). Python tourne en PID 1 dans le conteneur: sans
+# gestionnaire, SIGTERM est ignore et Docker tue le process (SIGKILL), parfois entre un
+# fill et son enregistrement. Un arret demande pendant un ordre attend la fin de l'ordre.
+_STOP_REQUESTED = False
+_ORDER_CRITICAL_DEPTH = 0
+
+
+def _on_sigterm(signum, frame) -> None:
+    global _STOP_REQUESTED
+    _STOP_REQUESTED = True
+    if _ORDER_CRITICAL_DEPTH == 0:
+        raise SystemExit(0)
+    print("[STOP] Arret demande: fin de l'ordre en cours d'abord.")
+
+
+def install_sigterm_handler() -> None:
+    try:
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except (ValueError, AttributeError, OSError):
+        pass
+
+
+def order_critical(fn):
+    """Section critique d'ordre: un SIGTERM recu pendant l'appel n'arrete le bot qu'apres."""
+    def wrapper(*args, **kwargs):
+        global _ORDER_CRITICAL_DEPTH
+        _ORDER_CRITICAL_DEPTH += 1
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _ORDER_CRITICAL_DEPTH -= 1
+            if _ORDER_CRITICAL_DEPTH == 0 and _STOP_REQUESTED:
+                raise SystemExit(0)
+
+    wrapper.__name__ = fn.__name__
+    wrapper.__doc__ = fn.__doc__
+    return wrapper
 
 
 def _pid_is_alive(pid: int) -> bool:
@@ -179,6 +254,9 @@ TELEGRAM_OFFSET_FILE_DEFAULT = "telegram_offset.json"
 FLASH_STATE_FILE_DEFAULT = "flash_state.json"
 SWAP_PENDING_FILE_DEFAULT = "swap_pending.json"
 FUNDAMENTAL_CACHE_FILE_DEFAULT = "fundamental_cache.json"
+# Derniere barre 1h evaluee en seance par ticker: un signal ne vaut qu'au premier scan
+# qui suit la cloture de sa barre (le backtest entre a l'ouverture de la barre suivante).
+SCAN_BAR_STATE_FILE_DEFAULT = "scan_bar_state.json"
 TRADE_JOURNAL_FILE_DEFAULT = "trades_journal.jsonl"
 PREMARKET_PREP_STATE_FILE_DEFAULT = "premarket_prep_state.json"
 # Incremente cette version quand la logique du plan pre-ouverture change,
@@ -372,19 +450,52 @@ def _td_register_consume() -> None:
     _TD_DAY_COUNT += 1
 
 
+_POSITIONS_CORRUPT: Optional[str] = None  # chemin d'un positions.json illisible
+
+
+def positions_file_corrupt() -> bool:
+    return _POSITIONS_CORRUPT is not None
+
+
 def load_positions(path: str) -> Dict[str, dict]:
-    """Charge un etat local des positions (achete/vente en attente)."""
+    """
+    Charge un etat local des positions (achete/vente en attente).
+    Fichier illisible: on ne repart PAS de zero en silence (une ligne ouverte serait
+    oubliee, puis le fichier ecrase). Copie de sauvegarde, alerte, ecriture refusee
+    et achats bloques jusqu'a reparation a la main.
+    """
+    global _POSITIONS_CORRUPT
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict):
+            if _POSITIONS_CORRUPT == path:
+                _POSITIONS_CORRUPT = None
+                print(f"[ETAT] {path} de nouveau lisible: achats et ecritures reactives.")
             return data
+        raise ValueError(f"contenu inattendu ({type(data).__name__})")
     except FileNotFoundError:
         return {}
-    except Exception:
-        # En cas de fichier corrompu, on repart proprement.
+    except Exception as exc:
+        if _POSITIONS_CORRUPT != path:
+            _POSITIONS_CORRUPT = path
+            backup = f"{path}.corrupt-{int(time.time())}"
+            try:
+                shutil.copy2(path, backup)
+            except Exception:
+                backup = "(copie impossible)"
+            msg = (
+                f"[ETAT] {path} illisible ({exc}). Achats bloques, fichier protege contre "
+                f"l'ecrasement. Copie: {backup}. A reparer a la main."
+            )
+            print(msg)
+            notify_telegram_safe(
+                os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
+                os.getenv("TELEGRAM_CHAT_ID", "").strip(),
+                msg,
+                "etat corrompu",
+            )
         return {}
-    return {}
 
 
 def _atomic_replace_file(tmp: str, path: str, *, retries: int = 5) -> None:
@@ -404,6 +515,9 @@ def _atomic_replace_file(tmp: str, path: str, *, retries: int = 5) -> None:
 
 
 def save_positions(path: str, positions: Dict[str, dict]) -> None:
+    if _POSITIONS_CORRUPT == path:
+        print(f"[ETAT] Ecriture de {path} refusee: fichier illisible a reparer d'abord.")
+        return
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = f"{path}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -2287,6 +2401,11 @@ def dynamic_notional_band_usd(
         line_target = 0.0
     if line_target > 0:
         line_target *= line_step_factor()[0]   # reinvestissement par paliers (1.0 si desactive)
+        if line_steps_enabled():
+            # Paliers = regle du backtest (rapport section 14): la ligne vaut exactement
+            # cible x (1+pas)^k, sans multiplicateurs ATR / conviction (+10 % sinon).
+            exact = max(0.0, min(remaining_usd, line_target))
+            return exact, exact, exact
         raw = line_target * vol_mult * conf_mult * regime_mult
         band_min = max(60.0, min(remaining_usd, line_target * 0.90))
         band_max = max(band_min, min(remaining_usd, line_target * 1.10))
@@ -4306,28 +4425,32 @@ def check_stop_loss_alert(
 
 
 def is_us_market_open(now: Optional[datetime] = None) -> bool:
-    """Retourne True si le marche US est ouvert (lun-ven, 9h30-16h00 EST/EDT)."""
+    """
+    True si le marche US est ouvert: lun-ven hors feries NYSE, 9h30 inclus a la cloture
+    exclue (16h00, ou 13h00 les jours de fermeture anticipee). A la cloture, un ordre
+    au marche DAY est rejete (Error 201) ou mis en attente (ferie): aucun ordre.
+    """
     if now is None:
         now = datetime.now(MARKET_TZ)
     else:
         now = now.astimezone(MARKET_TZ)
 
-    if now.weekday() >= 5:  # 5 = samedi, 6 = dimanche
+    if now.weekday() >= 5 or is_market_holiday(now.date()):
         return False
 
     current_minutes = now.hour * 60 + now.minute
     open_minutes = MARKET_OPEN_HOUR * 60 + MARKET_OPEN_MINUTE
-    close_minutes = MARKET_CLOSE_HOUR * 60 + MARKET_CLOSE_MINUTE
-    return open_minutes <= current_minutes <= close_minutes
+    return open_minutes <= current_minutes < market_close_minutes(now.date())
 
 
 def minutes_until_us_market_close(now: Optional[datetime] = None) -> float:
-    """Minutes restantes avant la cloture reguliere US (16h00 NY). Negatif si marche ferme."""
+    """Minutes restantes avant la cloture US du jour (16h00 ou 13h00 NY). Negatif si passee."""
     if now is None:
         now = datetime.now(MARKET_TZ)
     else:
         now = now.astimezone(MARKET_TZ)
-    close_today = now.replace(hour=MARKET_CLOSE_HOUR, minute=0, second=0, microsecond=0)
+    close_min = market_close_minutes(now.date())
+    close_today = now.replace(hour=close_min // 60, minute=close_min % 60, second=0, microsecond=0)
     return (close_today - now).total_seconds() / 60.0
 
 
@@ -4354,7 +4477,7 @@ def block_buy_min_before_close_minutes() -> float:
 
 
 def is_after_us_close(now: Optional[datetime] = None) -> bool:
-    """True a partir de 16h00 NY: un ordre au marche DAY serait rejete (Error 201, bourse fermee)."""
+    """True a partir de la cloture NY du jour: un ordre au marche DAY serait rejete (Error 201)."""
     return minutes_until_us_market_close(now) <= 0
 
 
@@ -4453,8 +4576,8 @@ def is_intraday_flat_catchup_window(now: Optional[datetime] = None) -> bool:
         return False
     current_minutes = now.hour * 60 + now.minute
     open_minutes = MARKET_OPEN_HOUR * 60 + MARKET_OPEN_MINUTE
-    close_minutes = MARKET_CLOSE_HOUR * 60 + MARKET_CLOSE_MINUTE
-    if current_minutes < open_minutes:
+    close_minutes = market_close_minutes(now.date())
+    if current_minutes < open_minutes or is_market_holiday(now.date()):
         return False
     mins_since_close = float(current_minutes - close_minutes)
     max_after = intraday_flat_catchup_max_min_after_close()
@@ -4860,7 +4983,13 @@ NYSE_HOLIDAYS = {
     "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
     "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31", "2027-06-18",
     "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24",
+    "2028-01-17", "2028-02-21", "2028-04-14", "2028-05-29", "2028-06-19", "2028-07-04",
+    "2028-09-04", "2028-11-23", "2028-12-25",
 }
+# Fermetures a 13h00 NY (calendrier NYSE publie le 23/12/2025).
+NYSE_EARLY_CLOSES = {"2026-11-27", "2026-12-24", "2027-11-26", "2028-07-03", "2028-11-24"}
+NYSE_CALENDAR_LAST_YEAR = 2028
+EARLY_CLOSE_MINUTES = 13 * 60
 
 
 def _env_on(key: str, default: str = "0") -> bool:
@@ -4870,6 +4999,18 @@ def _env_on(key: str, default: str = "0") -> bool:
 def market_holidays() -> List[str]:
     extra = [x.strip() for x in os.getenv("TRADING_EXTRA_MARKET_HOLIDAYS", "").split(",") if x.strip()]
     return sorted(NYSE_HOLIDAYS | set(extra))
+
+
+def is_market_holiday(day: date) -> bool:
+    return day.isoformat() in set(market_holidays())
+
+
+def market_close_minutes(day: date) -> int:
+    """Heure de cloture NY du jour, en minutes (13h00 les jours de fermeture anticipee)."""
+    extra = {x.strip() for x in os.getenv("TRADING_EXTRA_EARLY_CLOSES", "").split(",") if x.strip()}
+    if day.isoformat() in NYSE_EARLY_CLOSES | extra:
+        return EARLY_CLOSE_MINUTES
+    return MARKET_CLOSE_HOUR * 60 + MARKET_CLOSE_MINUTE
 
 
 def max_hold_sessions() -> int:
@@ -5008,7 +5149,7 @@ def maybe_max_hold_exit_positions(
         positions[ticker] = st
         save_positions(position_file, positions)
         if tries == 3 and bot_token and chat_id:
-            send_telegram_alert(
+            notify_telegram_safe(
                 bot_token,
                 chat_id,
                 (
@@ -5065,7 +5206,7 @@ def drop_forming_bar(df: pd.DataFrame, interval: str, now: Optional[datetime] = 
     ts = ts.tz_localize(MARKET_TZ) if ts.tzinfo is None else ts.tz_convert(MARKET_TZ)
     iv = (interval or "").strip().lower()
     if iv == "1d":
-        closed = now_ny.hour * 60 + now_ny.minute >= MARKET_CLOSE_HOUR * 60 + MARKET_CLOSE_MINUTE
+        closed = now_ny.hour * 60 + now_ny.minute >= market_close_minutes(now_ny.date())
         if ts.date() == now_ny.date() and not closed:
             return df.iloc[:-1]
         return df
@@ -5073,7 +5214,8 @@ def drop_forming_bar(df: pd.DataFrame, interval: str, now: Optional[datetime] = 
     if minutes is None:
         return df
     end = ts + pd.Timedelta(minutes=minutes)
-    session_close = ts.replace(hour=MARKET_CLOSE_HOUR, minute=MARKET_CLOSE_MINUTE, second=0, microsecond=0)
+    close_min = market_close_minutes(ts.date())
+    session_close = ts.replace(hour=close_min // 60, minute=close_min % 60, second=0, microsecond=0)
     if end > session_close >= ts:
         end = session_close
     if end > pd.Timestamp(now_ny):
@@ -5119,7 +5261,8 @@ def count_recent_day_trades(journal_file: str, now: Optional[datetime] = None, w
                     ev = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                ts = _parse_journal_ts_to_ny(str(ev.get("ts_utc", "")))
+                # vente constatee apres coup (coupure): dater le day trade sur le fill reel
+                ts = _parse_journal_ts_to_ny(str(ev.get("exit_fill_ts_utc") or ev.get("ts_utc", "")))
                 if ts is None:
                     continue
                 tk = normalize_ticker(str(ev.get("ticker", "")))
@@ -5176,6 +5319,13 @@ def strategy_equity_path(base_budget_usd: float, journal_file: str, since_txt: s
         eq += pnl
         peak = max(peak, eq)
     return eq, peak
+
+
+def line_steps_enabled() -> bool:
+    try:
+        return float(os.getenv("TRADING_LINE_STEP_PCT", "0") or 0) > 0
+    except ValueError:
+        return False
 
 
 def line_step_factor(journal_file: Optional[str] = None) -> Tuple[float, int, float]:
@@ -5255,29 +5405,18 @@ def equity_drawdown_blocks_buys(base_budget_usd: float, journal_file: str) -> Tu
 
 
 def get_next_us_market_open(now: Optional[datetime] = None) -> datetime:
-    """
-    Retourne la prochaine ouverture theorique du marche US (lun-ven 9h30 NY).
-    Note: ne tient pas compte des jours feries.
-    """
+    """Retourne la prochaine ouverture du marche US (9h30 NY, hors week-ends et feries NYSE)."""
     if now is None:
         now = datetime.now(MARKET_TZ)
     else:
         now = now.astimezone(MARKET_TZ)
 
     open_today = now.replace(hour=MARKET_OPEN_HOUR, minute=MARKET_OPEN_MINUTE, second=0, microsecond=0)
-
-    if now.weekday() >= 5:
-        days_ahead = (7 - now.weekday()) % 7
-        if days_ahead <= 0:
-            days_ahead = 1
-        target = now + timedelta(days=days_ahead)
-        return target.replace(hour=MARKET_OPEN_HOUR, minute=MARKET_OPEN_MINUTE, second=0, microsecond=0)
-
-    if now < open_today:
+    if now < open_today and now.weekday() < 5 and not is_market_holiday(now.date()):
         return open_today
 
     target = now + timedelta(days=1)
-    while target.weekday() >= 5:
+    while target.weekday() >= 5 or is_market_holiday(target.date()):
         target += timedelta(days=1)
     return target.replace(hour=MARKET_OPEN_HOUR, minute=MARKET_OPEN_MINUTE, second=0, microsecond=0)
 
@@ -6100,6 +6239,15 @@ def _twelvedata_interval_from_input(interval: str) -> Optional[str]:
     return None
 
 
+def _tag_data_source(df: pd.DataFrame, source: str) -> pd.DataFrame:
+    """Note la source des bougies: seules celles de Yahoo ont le decoupage du backtest."""
+    try:
+        df.attrs["source"] = source
+    except Exception:
+        pass
+    return df
+
+
 def _fetch_price_data_twelvedata(ticker: str, period: str, interval: str) -> pd.DataFrame:
     api_key = os.getenv("TWELVEDATA_API_KEY", "").strip()
     if not api_key:
@@ -6177,7 +6325,7 @@ def _fetch_price_data_twelvedata(ticker: str, period: str, interval: str) -> pd.
 
     df = pd.DataFrame(rows, index=pd.DatetimeIndex(idx_list))
     df = df[~df.index.duplicated(keep="last")].sort_index()
-    return df
+    return _tag_data_source(df, "twelvedata")
 
 
 def _fetch_price_data_finnhub(ticker: str, period: str, interval: str) -> pd.DataFrame:
@@ -6239,7 +6387,7 @@ def _fetch_price_data_finnhub(ticker: str, period: str, interval: str) -> pd.Dat
         index=idx,
     )
     df = df[~df.index.duplicated(keep="last")].sort_index()
-    return df
+    return _tag_data_source(df, "finnhub")
 
 
 def _finnhub_quote_timeout_sec() -> float:
@@ -6373,7 +6521,7 @@ def _fetch_price_data_yahoo(ticker: str, period: str, interval: str) -> pd.DataF
         # Erreur ticker/format locale — pas un rate-limit global.
         raise
     _register_yf_success()
-    return data
+    return _tag_data_source(data, "yahoo")
 
 
 def _data_fallback_to_ibkr_enabled() -> bool:
@@ -6391,7 +6539,7 @@ def _fetch_price_data_ibkr(ticker: str, period: str, interval: str) -> pd.DataFr
     df = fetch_ibkr_historical_ohlcv(ticker, period=period, interval=interval)
     if df is None or getattr(df, "empty", True):
         raise ValueError(f"IBKR: aucune donnee pour {ticker}")
-    return df
+    return _tag_data_source(df, "ibkr")
 
 
 def fetch_price_data(ticker: str, period: str, interval: str) -> pd.DataFrame:
@@ -8215,6 +8363,7 @@ def ibkr_auto_buy_prepare_notional(
         return notional_usd, None
 
 
+@order_critical
 def record_confirmed_buy(
     positions: Dict[str, Dict[str, object]],
     position_file: str,
@@ -8362,6 +8511,30 @@ def ibkr_close_confirm_debounce_sec() -> float:
         return 5.0
 
 
+def estimate_exit_without_fill(
+    ref_px: Optional[float],
+    stop_loss: Optional[float],
+    take_profit: Optional[float],
+    entry_px: float,
+) -> Tuple[float, str]:
+    """
+    Sortie constatee chez IBKR sans execution retrouvee (l'API ne rend que celles du
+    jour: cas d'un SL/TP touche pendant une coupure). Le cours du moment faussait le PnL
+    (journal, paliers, coupe-circuit): on retient le niveau SL ou TP le plus proche du
+    cours, c'est celui qui a le plus probablement ete touche. Source "estime_*".
+    """
+    ref = float(ref_px) if ref_px is not None and ref_px > 0 else 0.0
+    sl = float(stop_loss or 0.0)
+    tp = float(take_profit or 0.0)
+    if ref > 0 and 0 < sl < tp:
+        if abs(ref - sl) <= abs(tp - ref):
+            return sl, "estime_niveau_sl"
+        return tp, "estime_niveau_tp"
+    if ref > 0:
+        return ref, "reference_price"
+    return float(entry_px or 0.0), "reference_price"
+
+
 def sync_ticker_closed_at_ibkr(
     ticker: str,
     positions: Dict[str, Dict[str, object]],
@@ -8470,10 +8643,6 @@ def sync_ticker_closed_at_ibkr(
                     foreign_client_id = None
     except ImportError:
         pass
-    if exit_px is None or exit_px <= 0:
-        ref_px = get_reference_price_usd(tk)
-        exit_px = float(ref_px) if ref_px is not None and ref_px > 0 else float(st.get("entry_price_usd", 0.0) or 0.0)
-        exit_src = "reference_price"
     entry_px = float(st.get("entry_price_usd", 0.0) or 0.0)
     size_usd = float(st.get("entry_notional_usd", 0.0) or 0.0)
     sl_ref = parse_price_value(str(st.get("stop_loss", "") or ""))
@@ -8488,6 +8657,8 @@ def sync_ticker_closed_at_ibkr(
             tp_ref = float(st.get("take_profit", 0.0) or 0.0) or None
         except (TypeError, ValueError):
             tp_ref = None
+    if exit_px is None or exit_px <= 0:
+        exit_px, exit_src = estimate_exit_without_fill(get_reference_price_usd(tk), sl_ref, tp_ref, entry_px)
     trailing_was_active = bool(st.get("trailing_active"))
     if foreign_client_id is not None:
         exit_reason = "ibkr_foreign_client"
@@ -8505,6 +8676,7 @@ def sync_ticker_closed_at_ibkr(
         source="ibkr_sync",
         exit_reason=exit_reason,
         exit_price_source=exit_src,
+        exit_fill_ts_utc=str(fill_detail.get("time_utc") or "") if exit_src == "ibkr_fill" else "",
     )
     st2 = normalize_position_state(positions.get(tk, {}))
     st2.pop("ibkr_sl_tp_active", None)
@@ -8545,6 +8717,76 @@ def sync_ticker_closed_at_ibkr(
         except Exception as exc:
             print(f"[IBKR] Telegram sync close {tk}: {exc}")
     return True
+
+
+def reconcile_ibkr_positions(
+    positions: Dict[str, Dict[str, object]],
+    position_file: str,
+    *,
+    journal_file: str,
+    journal_enabled: bool,
+    bot_token: str = "",
+    chat_id: str = "",
+) -> int:
+    """
+    Debut de cycle, avant tout ordre: rapproche IBKR et positions.json.
+    - ordres orphelins annules (BUY du bot restes ouverts, ventes sur titre sans position);
+    - position IBKR inconnue du bot sur un titre de l'univers (fill apres un timeout, arret
+      brutal entre l'ordre et l'enregistrement): reprise en gestion (SL/TP poses par la
+      synchro SL/TP), sinon le bot l'ignorerait et pourrait ouvrir une 2e ligne;
+      hors univers ou a decouvert: alerte seulement.
+    Retourne le nombre de positions reprises.
+    """
+    if not ibkr_auto_execute_enabled() or positions_file_corrupt():
+        return 0
+    try:
+        from ibkr_execution import reconcile_ibkr_orders_and_positions, recalc_sl_tp_at_fill
+    except ImportError:
+        return 0
+    try:
+        held, cancelled = reconcile_ibkr_orders_and_positions()
+    except Exception as exc:
+        print(f"[IBKR] Rapprochement ignore: {exc}")
+        return 0
+    alerts: List[str] = []
+    if cancelled:
+        alerts.append("Ordres orphelins annules: " + ", ".join(cancelled))
+    universe = set(get_tickers_from_env())
+    adopted = 0
+    for sym, (qty, avg) in sorted(held.items()):
+        st = normalize_position_state(positions.get(sym, {}))
+        if st.get("in_position") or st.get("pending_sell"):
+            continue
+        if qty < 0:
+            alerts.append(f"{sym}: position A DECOUVERT chez IBKR ({qty:g}) — a fermer a la main.")
+            continue
+        if sym not in universe or avg <= 0:
+            alerts.append(f"{sym}: {qty:g} action(s) chez IBKR hors gestion du bot — laissees telles quelles.")
+            continue
+        sl, tp = recalc_sl_tp_at_fill(avg, None, None)
+        record_confirmed_buy(
+            positions,
+            position_file,
+            sym,
+            notional_usd=qty * avg,
+            entry_price_usd=avg,
+            take_profit=tp,
+            stop_loss=sl,
+            journal_file=journal_file,
+            journal_enabled=journal_enabled,
+            source="ibkr_reconcile",
+            entry_source="ibkr_reconcile",
+        )
+        adopted += 1
+        alerts.append(
+            f"{sym}: {qty:g} action(s) chez IBKR inconnues du bot (prix moyen {avg:.2f}) — "
+            f"reprises en gestion, SL/TP {float(sl or 0):.2f}/{float(tp or 0):.2f} poses par la synchro."
+        )
+    if alerts:
+        msg = "RAPPROCHEMENT IBKR\n" + "\n".join(alerts)
+        print(f"[IBKR] {msg}")
+        notify_telegram_safe(bot_token, chat_id, msg, "rapprochement IBKR")
+    return adopted
 
 
 def sync_positions_closed_at_ibkr(
@@ -8758,7 +9000,11 @@ def sync_open_positions_sl_tp_at_ibkr(
     if os.getenv("IBKR_SYNC_SL_TP_ENABLED", "1").strip().lower() not in {"1", "true", "yes", "y"}:
         return 0
     try:
-        from ibkr_execution import guard_ibkr_foreign_exit_orders, sync_ibkr_sl_tp_for_position
+        from ibkr_execution import (
+            guard_ibkr_foreign_exit_orders,
+            ibkr_place_sl_tp_enabled,
+            sync_ibkr_sl_tp_for_position,
+        )
     except ImportError:
         return 0
     open_syms = [
@@ -8776,8 +9022,11 @@ def sync_open_positions_sl_tp_at_ibkr(
         st = normalize_position_state(raw)
         if not bool(st.get("in_position")) or bool(st.get("pending_sell")):
             continue
-        if not bool(st.get("ibkr_sl_tp_active")):
+        sl_tp_missing = not bool(st.get("ibkr_sl_tp_active"))
+        if sl_tp_missing and not ibkr_place_sl_tp_enabled():
             continue
+        # SL/TP refuse a l'achat: on le repose ici a chaque cycle jusqu'a ce qu'il tienne,
+        # sinon seule l'alerte locale (au rythme des scans) protegeait la ligne.
         sl = float(st.get("stop_loss", 0.0) or 0.0)
         tp = float(st.get("take_profit", 0.0) or 0.0)
         entry = float(st.get("entry_price_usd", 0.0) or 0.0)
@@ -8795,7 +9044,7 @@ def sync_open_positions_sl_tp_at_ibkr(
         if not ok:
             print(f"[IBKR] Sync SL/TP {tk} ignore: {msg}")
             continue
-        if changed:
+        if changed or sl_tp_missing:
             synced += 1
             # Re-assure l'etat local (notamment apres cap TP dynamique).
             mark_ibkr_sl_tp_active(
@@ -8836,6 +9085,7 @@ def _record_confirmed_buy_journal(
         )
 
 
+@order_critical
 def record_confirmed_sell(
     positions: Dict[str, Dict[str, object]],
     position_file: str,
@@ -8847,8 +9097,13 @@ def record_confirmed_sell(
     source: str = "manual",
     exit_reason: Optional[str] = None,
     exit_price_source: Optional[str] = None,
+    exit_fill_ts_utc: str = "",
 ) -> Tuple[Dict[str, object], Optional[float], Optional[float]]:
-    """Enregistre une vente confirmee. Retourne (state, pnl_usd, pnl_pct)."""
+    """
+    Enregistre une vente confirmee. Retourne (state, pnl_usd, pnl_pct).
+    exit_fill_ts_utc: heure reelle du fill quand la vente est constatee apres coup (synchro):
+    le compteur PDT date le day trade sur elle, pas sur l'heure du constat.
+    """
     tk = normalize_ticker(ticker)
     state = normalize_position_state(positions.get(tk, {}))
     pf = infer_portfolio_profile_for_ticker(tk, state)
@@ -8878,7 +9133,8 @@ def record_confirmed_sell(
     state.pop("intraday_runner_hold_notified", None)
     state.pop("intraday_loss_hold_notified", None)
     positions[tk] = state
-    save_positions(position_file, positions)
+    # Journal d'abord: si le process est tue entre les deux, la synchro suivante voit la
+    # ligne encore ouverte, retrouve le trade_closed deja ecrit et corrige l'etat local.
     if journal_enabled and journal_file:
         append_journal_event(
             journal_file,
@@ -8909,10 +9165,13 @@ def record_confirmed_sell(
                 closed_evt["exit_reason"] = str(exit_reason).strip()
             if exit_price_source:
                 closed_evt["exit_price_source"] = str(exit_price_source).strip()
+            if exit_fill_ts_utc:
+                closed_evt["exit_fill_ts_utc"] = str(exit_fill_ts_utc).strip()
             if journal_trade_closed_exists(journal_file, closed_evt):
                 print(f"[Journal] trade_closed duplique ignore: {tk}")
             else:
                 append_journal_event(journal_file, closed_evt)
+    save_positions(position_file, positions)
     return state, pnl_usd, pnl_pct
 
 
@@ -8930,6 +9189,7 @@ def clear_rejected_buy_signal_state(
     save_positions(position_file, positions)
 
 
+@order_critical
 def attempt_ibkr_buy(
     *,
     ticker: str,
@@ -9025,7 +9285,7 @@ def attempt_ibkr_buy(
             )
             if result.warning:
                 msg += f"\nNote: {result.warning}"
-            send_telegram_alert(bot_token, chat_id, msg)
+            notify_telegram_safe(bot_token, chat_id, msg)
         print(f"[IBKR] {status_line}")
         return True
     print(f"[IBKR] Echec achat {ticker}: {result.error}")
@@ -9054,7 +9314,7 @@ def attempt_ibkr_buy(
         )
     if ibkr_fallback_to_manual() and not clear_rejected:
         if bot_token and chat_id:
-            send_telegram_alert(
+            notify_telegram_safe(
                 bot_token,
                 chat_id,
                 f"IBKR achat echoue ({ticker}): {result.error}\n"
@@ -9062,7 +9322,7 @@ def attempt_ibkr_buy(
             )
         return False
     if bot_token and chat_id:
-        send_telegram_alert(
+        notify_telegram_safe(
             bot_token,
             chat_id,
             f"❌ IBKR ACHAT REJETE — {normalize_ticker(ticker)}\n{result.error}\n"
@@ -9071,6 +9331,7 @@ def attempt_ibkr_buy(
     return False
 
 
+@order_critical
 def attempt_ibkr_sell(
     *,
     ticker: str,
@@ -9140,7 +9401,7 @@ def attempt_ibkr_sell(
         if pnl_usd is not None and pnl_pct is not None:
             pnl_txt = f"\nPnL estime: {pnl_usd:+.2f} USD ({pnl_pct:+.2f}%)"
         if bot_token and chat_id:
-            send_telegram_alert(
+            notify_telegram_safe(
                 bot_token,
                 chat_id,
                 f"VENTE AUTO IBKR — {normalize_ticker(ticker)}\n{status_line}{pnl_txt}",
@@ -9177,7 +9438,7 @@ def attempt_ibkr_sell(
             },
         )
     if bot_token and chat_id:
-        send_telegram_alert(
+        notify_telegram_safe(
             bot_token,
             chat_id,
             f"❌ IBKR VENTE REJETEE — {tk}\n{result.error}\n"
@@ -9200,7 +9461,18 @@ def send_telegram_alert(bot_token: str, chat_id: str, message: str) -> None:
             last_error = exc
             if attempt < 3:
                 time.sleep(2 * attempt)
-    raise RuntimeError(f"Echec envoi Telegram apres 3 tentatives: {last_error}")
+    # l'erreur requests contient l'URL, donc le token: on ne la chaine pas
+    raise RuntimeError(f"Echec envoi Telegram apres 3 tentatives: {redact_secrets(str(last_error))}") from None
+
+
+def notify_telegram_safe(bot_token: str, chat_id: str, message: str, context: str = "") -> None:
+    """Notification non bloquante: une panne Telegram ne doit pas interrompre un ordre ou un cycle."""
+    if not bot_token or not chat_id:
+        return
+    try:
+        send_telegram_alert(bot_token, chat_id, message)
+    except Exception as exc:
+        print(f"[Telegram] Notification {context} non envoyee: {exc}")
 
 
 def load_offset(path: str) -> int:
@@ -10166,6 +10438,7 @@ def analyze_ticker(ticker: str, period: str, interval: str) -> Optional[Dict[str
     """Pipeline complet pour un ticker: donnees, indicateurs, news, IA."""
     try:
         raw = fetch_price_data(ticker, period=period, interval=interval)
+        data_source = str(getattr(raw, "attrs", {}).get("source", ""))
         raw = normalize_ohlc_columns(raw, ticker)
         print(f"[{ticker}] Bougies telechargees ({period}, {interval}): {len(raw)}")
 
@@ -10178,6 +10451,7 @@ def analyze_ticker(ticker: str, period: str, interval: str) -> Optional[Dict[str
                 f"Tentative fallback en {fallback_interval}..."
             )
             raw = fetch_price_data(ticker, period=period, interval=fallback_interval)
+            data_source = str(getattr(raw, "attrs", {}).get("source", ""))
             raw = normalize_ohlc_columns(raw, ticker)
             used_interval = fallback_interval
             print(f"[{ticker}] Bougies telechargees ({period}, {fallback_interval}): {len(raw)}")
@@ -10218,6 +10492,8 @@ def analyze_ticker(ticker: str, period: str, interval: str) -> Optional[Dict[str
     return {
         "ticker": ticker,
         "bar_date": bar_ts.date().isoformat(),
+        "bar_ts": bar_ts.isoformat(),
+        "data_source": data_source,
         "current_price": f"{current_price}",
         "atr": f"{atr}",
         "rsi": f"{rsi}",
@@ -11632,6 +11908,35 @@ def run_premarket_preparation(
         return False
 
 
+def scan_buy_block_reason(
+    analysis: Dict[str, Any],
+    *,
+    bar_already_seen: bool,
+    entries_blocked_reason: str = "",
+    now: Optional[datetime] = None,
+) -> str:
+    """
+    Raison de ne PAS executer un ACHETER du scan ('' = autorise). Regles du backtest:
+    pas d'ordre bourse fermee (la barre est relue a l'ouverture suivante), un signal ne
+    vaut qu'au premier scan apres la cloture de sa barre, et sur des bougies Yahoo.
+    """
+    if not is_us_market_open(now):
+        return ("bourse fermee (cloture passee ou jour ferie), la barre sera relue au premier "
+                "scan de la seance suivante, entree a l'ouverture comme le backtest")
+    if bar_already_seen:
+        bar = str(analysis.get("bar_ts") or "")
+        return (f"barre {bar[11:16]} deja evaluee a un scan precedent "
+                f"(le backtest n'entre qu'a l'ouverture de la barre suivante)")
+    if entries_blocked_reason:
+        return entries_blocked_reason
+    if positions_file_corrupt():
+        return "positions.json illisible (a reparer)"
+    src = str(analysis.get("data_source") or "")
+    if src and src != "yahoo":
+        return f"bougies {src} (decoupage horaire different de Yahoo et du backtest)"
+    return ""
+
+
 def _scan_risk_off(ctx: Dict[str, Any], bar_date: str) -> bool:
     """VIX de la veille du jour de la barre du signal (regle du backtest), lu une fois par date."""
     if not bar_date or "risk_off_by_date" not in ctx:
@@ -12199,6 +12504,14 @@ def run_cycle() -> Dict[str, int]:
             bot_token=telegram_token,
             chat_id=telegram_chat_id,
         )
+        reconcile_ibkr_positions(
+            positions,
+            position_file,
+            journal_file=journal_file,
+            journal_enabled=journal_enabled,
+            bot_token=telegram_token,
+            chat_id=telegram_chat_id,
+        )
     maybe_intraday_flat_positions(
         positions,
         position_file,
@@ -12293,7 +12606,7 @@ def run_cycle() -> Dict[str, int]:
         bot_token=telegram_token,
         chat_id=telegram_chat_id,
     )
-    maybe_max_hold_exit_positions(
+    max_hold_exits = maybe_max_hold_exit_positions(
         positions,
         position_file,
         journal_file=journal_file,
@@ -12301,6 +12614,16 @@ def run_cycle() -> Dict[str, int]:
         bot_token=telegram_token,
         chat_id=telegram_chat_id,
     )
+    # Le backtest traite les entrees avant les sorties d'une meme barre: la ligne liberee
+    # par une sortie de fin de seance ne sert pas aux signaux lus dans ce scan.
+    entries_blocked_reason = (
+        "sortie duree max dans ce scan (le backtest garde la ligne jusqu'a la cloture)"
+        if max_hold_exits > 0 else ""
+    )
+    bar_state_file = (
+        os.getenv("SCAN_BAR_STATE_FILE", SCAN_BAR_STATE_FILE_DEFAULT).strip() or SCAN_BAR_STATE_FILE_DEFAULT
+    )
+    bar_state = load_json_dict(bar_state_file)
     pdt_block_buys, pdt_count, pdt_limit = pdt_guard_blocks_buys(journal_file)
     if pdt_block_buys:
         print(f"[RISK] Garde-fou PDT: {pdt_count} day trade(s) sur 5 jours ouvres "
@@ -12395,6 +12718,11 @@ def run_cycle() -> Dict[str, int]:
         decision = str(oc["decision"]).upper()
         final_ticker = normalize_ticker(str(oc["final_ticker"]))
         momentum_score = float(oc.get("momentum_score", 0.0) or 0.0)
+        bar_key = str(analysis.get("bar_ts") or "")
+        bar_already_seen = bool(bar_key) and bar_state.get(final_ticker) == bar_key
+        if bar_key and not bar_already_seen:
+            bar_state[final_ticker] = bar_key
+            save_json_dict(bar_state_file, bar_state)
 
         try:
             if ticker not in positions:
@@ -12476,11 +12804,13 @@ def run_cycle() -> Dict[str, int]:
             print(f"[{ticker}] MTF: {higher_tf.get('summary', 'Indisponible')}")
 
         if decision == "ACHETER":
-            if is_after_us_close():
-                print(
-                    f"[{ticker}] Decision ACHETER reportee: bourse fermee (16h00 NY passe). "
-                    f"La barre sera relue au premier scan de la seance suivante (entree a l'ouverture, comme le backtest)."
-                )
+            block = scan_buy_block_reason(
+                analysis,
+                bar_already_seen=bar_already_seen,
+                entries_blocked_reason=entries_blocked_reason,
+            )
+            if block:
+                print(f"[{ticker}] Decision ACHETER ignoree: {block}.")
                 continue
             buy_blocked_near_close, mins_to_close = is_buy_blocked_near_close()
             if buy_blocked_near_close:
@@ -12939,6 +13269,9 @@ def run_cycle() -> Dict[str, int]:
                         f"[{ticker}] ACHETER non execute (ticket IBKR) — "
                         f"swap budget non retenu (garde-fous swap)."
                     )
+                    # echec d'execution: la meme barre pourra etre retentee au scan suivant
+                    bar_state.pop(final_ticker, None)
+                    save_json_dict(bar_state_file, bar_state)
                 continue
             pending_buys.append(buy_payload)
             print(
@@ -13113,6 +13446,13 @@ def main() -> None:
     """
     load_runtime_env()
     ensure_stdio_utf8()
+    install_secret_redaction()
+    install_sigterm_handler()
+    if datetime.now(MARKET_TZ).year > NYSE_CALENDAR_LAST_YEAR:
+        print(
+            f"[CALENDRIER] Feries / fermetures anticipees NYSE connus jusqu'en {NYSE_CALENDAR_LAST_YEAR} "
+            f"seulement: completer NYSE_HOLIDAYS et NYSE_EARLY_CLOSES."
+        )
 
     parser = argparse.ArgumentParser(
         description="Bot trading Telegram + LLM. Mode manuel (/confirm_*) ou execution auto IBKR (IBKR_AUTO_EXECUTE=1)."
@@ -13625,7 +13965,16 @@ def main() -> None:
 
     while True:
         cycle_start = time.perf_counter()
-        stats = run_cycle()
+        try:
+            stats = run_cycle()
+        except Exception as exc:
+            # Une erreur (Telegram en panne, donnee inattendue...) faisait sortir le bot,
+            # puis Docker le relancait en boucle: on abandonne seulement ce cycle.
+            import traceback
+
+            print(f"[Cycle] Erreur non geree, cycle abandonne: {exc}")
+            traceback.print_exc()
+            stats = {}
         elapsed = time.perf_counter() - cycle_start
         cycle_idx += 1
         try:

@@ -47,13 +47,12 @@ def _install_ib_insync_patches(ib: object) -> None:
         return
     setattr(ib, "_tb_patched", True)
 
-    def _on_error_no_acct_summary_resubscribe(
-        req_id: int, error_code: int, error_string: str, contract: object
-    ) -> None:
-        if error_code == 1102:
-            return
-
-    ib._onError = _on_error_no_acct_summary_resubscribe  # type: ignore[attr-defined]
+    # IB.__init__ abonne deja la methode liee ib._onError a errorEvent: remplacer
+    # l'attribut ne change rien, il faut desabonner le gestionnaire d'origine.
+    try:
+        ib.errorEvent -= ib._onError  # type: ignore[attr-defined]
+    except Exception:
+        pass
 
     wrapper_logger = logging.getLogger("ib_insync.wrapper")
     if not any(isinstance(f, _IbkrWrapperLogFilter) for f in wrapper_logger.filters):
@@ -81,6 +80,11 @@ except ImportError:  # pragma: no cover
 _REJECT_STATUSES = frozenset(
     {"Cancelled", "ApiCancelled", "Inactive", "PendingCancel", "Rejected"}
 )
+
+# Marqueur d'erreur: l'ordre n'a pas pu etre annule et peut encore s'executer chez IBKR.
+# L'appelant ne doit alors ni renvoyer un ordre, ni reposer un SL/TP (risque de double
+# achat ou de position a decouvert).
+ORDER_CANCEL_UNCONFIRMED = "ANNULATION NON CONFIRMEE"
 
 # Statuts IBKR = ordre accepte / en attente d'execution (ordre enfant SL/TP considere actif)
 _WORKING_STATUSES = frozenset({"ApiPending", "PendingSubmit", "PreSubmitted", "Submitted"})
@@ -490,10 +494,12 @@ class IBKRSession:
             self.ib.reqAllOpenOrders()
         except Exception:
             pass
-        try:
-            self.ib.reqAutoOpenOrders(True)
-        except Exception:
-            pass
+        if client_id == 0:
+            # IBKR refuse autoBind aux autres clients (Error 321 a chaque connexion)
+            try:
+                self.ib.reqAutoOpenOrders(True)
+            except Exception:
+                pass
         print(
             f"[IBKR] Client API exclusif id={client_id}, orderRef={ibkr_order_ref()}. "
             f"Dans Gateway: Master API client ID = {client_id} "
@@ -648,7 +654,9 @@ class IBKRSession:
         out = df[need + ["Volume"]].copy()
         out.index = pd.to_datetime(out.index)
         if getattr(out.index, "tz", None) is not None:
-            out.index = out.index.tz_localize(None)
+            # Heures renvoyees dans le fuseau de la Gateway (Europe/Paris sur la VM):
+            # convertir en heure de New York avant de retirer le fuseau, comme Yahoo.
+            out.index = out.index.tz_convert("America/New_York").tz_localize(None)
         out = out[~out.index.duplicated(keep="last")].sort_index()
         return out
 
@@ -732,24 +740,29 @@ class IBKRSession:
         """
         Attend le fill. Retourne (filled, avg, status, partial, log_tail).
         Leve RuntimeError si rejet sans fill.
+        Au-dela du delai, l'ordre (ou son reliquat) est annule et l'annulation attendue:
+        un ordre laisse vivant pourrait s'executer plus tard a l'insu du bot.
         """
         deadline = time.time() + timeout_sec
         while time.time() < deadline:
             self.ib.sleep(0.3)
             if trade.isDone():
                 break
+        timed_out = not trade.isDone()
+        cancel_ok = self._cancel_trade_and_wait(trade) if timed_out else True
         status, _, log_tail = _trade_status_detail(trade)
         filled = float(trade.orderStatus.filled or 0.0)
         avg = float(trade.orderStatus.avgFillPrice or 0.0)
 
-        if status in _REJECT_STATUSES and filled <= 0:
-            raise RuntimeError(_format_order_error(trade, context="Ordre rejete"))
-
         if filled <= 0 or avg <= 0:
-            if status in {"Submitted", "PreSubmitted", "PendingSubmit"}:
-                raise RuntimeError(
-                    _format_order_error(trade, context=f"Timeout {timeout_sec:.0f}s sans fill")
+            if timed_out:
+                ctx = f"Timeout {timeout_sec:.0f}s sans fill — " + (
+                    "ordre annule" if cancel_ok
+                    else f"{ORDER_CANCEL_UNCONFIRMED} (ordre peut-etre encore actif)"
                 )
+                raise RuntimeError(_format_order_error(trade, context=ctx))
+            if status in _REJECT_STATUSES:
+                raise RuntimeError(_format_order_error(trade, context="Ordre rejete"))
             raise RuntimeError(_format_order_error(trade, context="Ordre non rempli"))
 
         partial = requested_qty > 0 and filled + 1e-6 < requested_qty
@@ -757,6 +770,21 @@ class IBKRSession:
             # Fill partiel puis annulation du reste
             pass
         return filled, avg, status, partial, log_tail
+
+    def _cancel_trade_and_wait(self, trade, timeout_sec: float = 8.0) -> bool:
+        """Annule un ordre et attend son statut final. True si l'ordre n'est plus actif."""
+        if trade.isDone():
+            return True
+        try:
+            self.ib.cancelOrder(trade.order)
+        except Exception as exc:
+            print(f"[IBKR] Annulation impossible: {exc}")
+        deadline = time.time() + max(0.5, float(timeout_sec))
+        while time.time() < deadline:
+            if trade.isDone():
+                return True
+            self.ib.sleep(0.25)
+        return trade.isDone()
 
     def bid_ask_snapshot(self, contract: Stock) -> Tuple[Optional[float], Optional[float]]:
         """
@@ -805,11 +833,13 @@ class IBKRSession:
         *,
         action: str,
         qty: float,
-    ) -> Tuple[float, float, int, str]:
+    ) -> Tuple[float, float, int, str, bool]:
         """
         Tente un ordre MIDPRICE (execution au milieu du NBBO ou mieux).
-        Retourne (filled, avg, order_id, note). Ne leve jamais: en cas d'echec
+        Retourne (filled, avg, order_id, note, settled). Ne leve jamais: en cas d'echec
         ou de non-execution, retourne filled=0 et l'appelant bascule au marche.
+        settled=False: l'annulation du reliquat n'est pas confirmee, l'ordre peut encore
+        s'executer; l'appelant ne doit PAS completer au marche (sur-achat sans protection).
 
         MIDPRICE n'est pas garanti de s'executer — c'est le compromis: on economise
         environ un demi-spread quand ca passe, on perd quelques secondes sinon.
@@ -834,28 +864,23 @@ class IBKRSession:
                     break
             filled = float(trade.orderStatus.filled or 0.0)
             avg = float(trade.orderStatus.avgFillPrice or 0.0)
+            settled = True
             if filled + 1e-6 < qty:
-                # non rempli ou partiel: on annule le reliquat avant de basculer
-                try:
-                    self.ib.cancelOrder(order)
-                    self.ib.sleep(0.5)
-                except Exception as exc:
-                    print(f"[IBKR] Annulation MIDPRICE impossible: {exc}")
+                # non rempli ou partiel: on annule le reliquat et on attend la confirmation
+                settled = self._cancel_trade_and_wait(trade, 5.0)
                 filled = float(trade.orderStatus.filled or 0.0)
                 avg = float(trade.orderStatus.avgFillPrice or 0.0)
             oid = int(trade.order.orderId or 0)
             if filled > 0 and avg > 0:
                 note = ("MIDPRICE rempli" if filled + 1e-6 >= qty
                         else f"MIDPRICE partiel {filled:.0f}/{qty:.0f}")
-                return filled, avg, oid, note
-            return 0.0, 0.0, oid, f"MIDPRICE non rempli en {timeout:.0f}s"
+                return filled, avg, oid, note, settled
+            return 0.0, 0.0, oid, f"MIDPRICE non rempli en {timeout:.0f}s", settled
         except Exception as exc:
+            settled = True
             if trade is not None:
-                try:
-                    self.ib.cancelOrder(order)
-                except Exception:
-                    pass
-            return 0.0, 0.0, 0, f"MIDPRICE indisponible ({exc})"
+                settled = self._cancel_trade_and_wait(trade, 5.0)
+            return 0.0, 0.0, 0, f"MIDPRICE indisponible ({exc})", settled
 
     def _place_and_wait_market(
         self,
@@ -889,7 +914,7 @@ class IBKRSession:
             and os.getenv("IBKR_OUTSIDE_RTH", "0").strip().lower() not in {"1", "true", "yes", "y"}
         ):
             want = float(max(1, int(quantity)))
-            mid_filled, mid_avg, mid_oid, mid_note = self._try_midprice(
+            mid_filled, mid_avg, mid_oid, mid_note, mid_settled = self._try_midprice(
                 contract, action=action, qty=want
             )
             if mid_note:
@@ -897,6 +922,13 @@ class IBKRSession:
                 note = f"{note} | {mid_note}" if note else mid_note
             if mid_filled + 1e-6 >= want and mid_avg > 0:
                 return mid_filled, mid_avg, mid_oid, "Filled", False, "", note
+            if not mid_settled:
+                # le MIDPRICE peut encore s'executer: pas de complement au marche
+                if mid_filled > 0 and mid_avg > 0:
+                    return mid_filled, mid_avg, mid_oid, "PartiallyFilled", True, "", (
+                        f"{note} | {ORDER_CANCEL_UNCONFIRMED} reliquat MIDPRICE"
+                    )
+                raise RuntimeError(f"MIDPRICE: {ORDER_CANCEL_UNCONFIRMED} — complement marche non envoye")
             # reliquat a couvrir au marche
             quantity = want - mid_filled
 
@@ -927,6 +959,45 @@ class IBKRSession:
             filled = total
             note = f"{note} + complement marche"
         return filled, avg, int(trade.order.orderId or 0), status, partial, log_tail, note
+
+    def positions_by_symbol(self) -> Dict[str, Tuple[float, float]]:
+        """Positions du compte chez IBKR: symbole -> (quantite, prix moyen). Cache rafraichi."""
+        self.ensure_connected()
+        try:
+            self.ib.reqPositions()
+            self.ib.sleep(1.0)
+        except Exception:
+            pass
+        out: Dict[str, Tuple[float, float]] = {}
+        for pos in self.ib.positions():
+            sym = str(getattr(pos.contract, "symbol", "") or "").upper()
+            qty = float(pos.position or 0.0)
+            if sym and abs(qty) > 1e-9:
+                out[sym] = (qty, float(pos.avgCost or 0.0))
+        return out
+
+    def cancel_stray_orders(self, held: Dict[str, Tuple[float, float]]) -> List[str]:
+        """
+        Annule, en debut de cycle (aucun ordre du bot n'est alors en vol):
+        - les BUY du bot restes ouverts (timeout, ferie): ils s'executeraient sans SL/TP;
+        - toute vente ouverte sur un titre sans position: un SL/TP orphelin ouvrirait un short.
+        Retourne la liste des ordres annules.
+        """
+        done: List[str] = []
+        for trade in list(self.ib.openTrades()):
+            order = trade.order
+            sym = str(getattr(trade.contract, "symbol", "") or "").upper()
+            action = str(getattr(order, "action", "") or "").upper()
+            stray_buy = action == "BUY" and self._is_our_order(order)
+            stray_sell = action == "SELL" and held.get(sym, (0.0, 0.0))[0] <= 0
+            if not (stray_buy or stray_sell):
+                continue
+            ok = self._cancel_trade_and_wait(trade)
+            done.append(
+                f"{action} {sym} {getattr(order, 'orderType', '?')} #{getattr(order, 'orderId', 0)}"
+                + ("" if ok else f" ({ORDER_CANCEL_UNCONFIRMED})")
+            )
+        return done
 
     def position_quantity(self, ticker: str) -> float:
         self.ensure_connected()
@@ -1271,10 +1342,12 @@ class IBKRSession:
             out["price"] = px2
             out["source"] = src2
             return out
-        _, px, cid, oid = best
+        best_t, px, cid, oid = best
         our = ibkr_our_client_id()
         out["price"] = float(px)
         out["source"] = "ibkr_fill"
+        if best_t.year > 1:
+            out["time_utc"] = best_t.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         out["client_id"] = int(cid)
         out["order_id"] = int(oid)
         out["foreign"] = bool(cid != our)
@@ -1283,20 +1356,21 @@ class IBKRSession:
             out["foreign"] = True
         return out
 
-    def _cancel_open_buy_orders_for_symbol(self, symbol: str) -> None:
-        """Annule uniquement les ordres BUY ouverts (avant retry, anti double-achat)."""
+    def _cancel_open_buy_orders_for_symbol(self, symbol: str) -> bool:
+        """
+        Annule les ordres BUY ouverts du symbole (anti double-achat) et attend la
+        confirmation. True si plus aucun BUY actif.
+        """
         sym = symbol.upper().strip()
+        ok = True
         for trade in list(self.ib.openTrades()):
             c = trade.contract
             if getattr(c, "symbol", "").upper() != sym:
                 continue
             if str(getattr(trade.order, "action", "") or "").upper() != "BUY":
                 continue
-            try:
-                self.ib.cancelOrder(trade.order)
-            except Exception:
-                pass
-        self.ib.sleep(0.5)
+            ok = self._cancel_trade_and_wait(trade) and ok
+        return ok
 
     def _recover_late_buy_fill(
         self,
@@ -1858,10 +1932,33 @@ class IBKRSession:
                     requested_qty=float(qty),
                 )
             except Exception as exc:
-                last_error = str(exc)
+                last_error = str(exc) or repr(exc)
                 _last_was_presubmitted = "PreSubmitted" in last_error or "Timeout" in last_error
-                if attempt == 0 and ibkr_order_retry_enabled():
+                live_order = ORDER_CANCEL_UNCONFIRMED in last_error
+                if attempt == 0 and ibkr_order_retry_enabled() and not live_order:
                     continue
+                # Dernier essai rate: aucun ordre BUY ne doit rester vivant, et un fill
+                # survenu pendant l'annulation doit etre recupere (SL/TP poses).
+                if buy_order_sent:
+                    try:
+                        self.ensure_connected()
+                        if not self._cancel_open_buy_orders_for_symbol(ticker):
+                            last_error = (
+                                f"{last_error} | {ORDER_CANCEL_UNCONFIRMED}: "
+                                f"ordre BUY {ticker} peut-etre encore actif chez IBKR"
+                            )
+                    except Exception as cancel_exc:
+                        last_error = f"{last_error} | annulation impossible ({cancel_exc})"
+                    if qty_before is not None:
+                        late = self._recover_late_buy_fill(
+                            ticker,
+                            qty_before,
+                            stop_loss=stop_loss,
+                            take_profit=take_profit,
+                            signal_price=signal_price,
+                        )
+                        if late is not None:
+                            return late
                 return ExecutionResult(
                     False,
                     ticker,
@@ -1953,10 +2050,18 @@ class IBKRSession:
                     requested_qty=float(sell_qty),
                 )
             except Exception as exc:
-                last_error = str(exc)
-                if attempt == 0 and ibkr_order_retry_enabled():
+                last_error = str(exc) or repr(exc)
+                live_order = ORDER_CANCEL_UNCONFIRMED in last_error
+                if attempt == 0 and ibkr_order_retry_enabled() and not live_order:
                     continue
-                if protection_cancelled:
+                if live_order:
+                    # La vente peut encore s'executer: reposer le SL/TP ouvrirait un
+                    # short si elle passe. La synchro du cycle suivant fera le point.
+                    last_error = (
+                        f"{last_error} | SL/TP NON reposes: la vente au marche peut encore "
+                        "s'executer (verifier IBKR)"
+                    )
+                elif protection_cancelled:
                     note = self._restore_protective_orders(ticker, prev_sl, prev_tp)
                     if note:
                         last_error = f"{last_error} | {note}"
@@ -2096,10 +2201,16 @@ class IBKRSession:
                     requested_qty=float(sell_qty),
                 )
             except Exception as exc:
-                last_error = str(exc)
-                if attempt == 0 and ibkr_order_retry_enabled():
+                last_error = str(exc) or repr(exc)
+                live_order = ORDER_CANCEL_UNCONFIRMED in last_error
+                if attempt == 0 and ibkr_order_retry_enabled() and not live_order:
                     continue
-                if protection_cancelled:
+                if live_order:
+                    last_error = (
+                        f"{last_error} | SL/TP NON reposes: la vente limite peut encore "
+                        "s'executer (verifier IBKR)"
+                    )
+                elif protection_cancelled:
                     note = self._restore_protective_orders(ticker, prev_sl, prev_tp)
                     if note:
                         last_error = f"{last_error} | {note}"
@@ -2176,7 +2287,12 @@ def _parse_utc_iso_z(value: str) -> Optional[datetime]:
 
 
 def _execution_time_utc(execution) -> Optional[datetime]:
-    raw = str(getattr(execution, "time", "") or "").strip()
+    t = getattr(execution, "time", None)
+    if isinstance(t, datetime) and t.tzinfo is not None:
+        # ib_insync fournit deja un datetime UTC: le repasser en texte perdait le fuseau
+        # (relu comme heure de New York, soit 4-5 h de decalage)
+        return t.astimezone(timezone.utc)
+    raw = str(t or "").strip()
     if not raw:
         return None
     try:
@@ -2238,6 +2354,13 @@ def fetch_ibkr_last_sell_fill_detail(
     except Exception as exc:
         print(f"[IBKR] Fills vente introuvables pour {symbol}: {exc}")
         return empty
+
+
+def reconcile_ibkr_orders_and_positions() -> Tuple[Dict[str, Tuple[float, float]], List[str]]:
+    """Debut de cycle: positions IBKR + annulation des ordres orphelins (voir cancel_stray_orders)."""
+    session = IBKRSession.get()
+    held = session.positions_by_symbol()
+    return held, session.cancel_stray_orders(held)
 
 
 def guard_ibkr_foreign_exit_orders(symbols: List[str]) -> List[str]:

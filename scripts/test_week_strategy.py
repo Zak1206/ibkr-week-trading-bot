@@ -289,6 +289,8 @@ def test_paper_profile_consistency():
     worst_dd = 48 if g("TRADING_LINE_STEP_PCT") > 0 else 28   # backtest: paliers -48%, ligne fixe -26/-28%
     check("coupe-circuit au-dela du pire DD backtest (-%d%%)" % worst_dd, g("RISK_MAX_DRAWDOWN_PCT") > worst_dd)
     check("CVS hors univers", "CVS" not in (env.get("TICKERS_OVERRIDE") or ""))
+    check("actions entieres arrondies a l'inferieur, comme le backtest",
+          env.get("IBKR_WHOLE_SHARE_ROUND_NEAREST") == "0")
     with with_env({"BUY_FIXED_SL_TP_ENABLED": "1", "BUY_SNIPER_MODE": "1", "TRADING_ENFORCE_RISK_CAP": "1",
                    **{k: env[k] for k in ("BUY_FIXED_STOP_PCT", "BUY_SNIPER_MAX_STOP_PCT", "TRADING_RISK_PER_TRADE_PCT")}}):
         sl, _ = M.compute_fixed_sl_tp(40.0, "HOOD")
@@ -395,7 +397,7 @@ def test_line_steps():
         write([260.0])
         _, lo, hi = M.dynamic_notional_band_usd(current_price=40.0, atr=1.0, conviction=80, remaining_usd=5000.0,
                                                 slots_left=1, risk_off=False)
-        check("couloir de taille suit le palier (1125-1375$)", abs(lo - 1125) < 1e-6 and abs(hi - 1375) < 1e-6,
+        check("paliers: ligne exacte du backtest (1250$, sans +/-10 %)", abs(lo - 1250) < 1e-6 and abs(hi - 1250) < 1e-6,
               f"lo={lo} hi={hi}")
         with with_env({"TRADING_LINE_STEP_PCT": "0"}):
             _, lo0, hi0 = M.dynamic_notional_band_usd(current_price=40.0, atr=1.0, conviction=80, remaining_usd=5000.0,
@@ -491,6 +493,112 @@ def test_daily_context_before_signal_bar():
     check("9h30 NY: achat possible", not M.is_after_us_close(ny(2026, 9, 28, 9, 30)))
 
 
+def test_calendar_and_order_guards():
+    print("\n[13] calendrier NYSE, garde-fous d'achat, etat corrompu, rapprochement IBKR, arret propre")
+    with with_env({"TRADING_EXTRA_MARKET_HOLIDAYS": None, "TRADING_EXTRA_EARLY_CLOSES": None}):
+        check("Thanksgiving 26/11: bourse fermee", not M.is_us_market_open(ny(2026, 11, 26, 10, 0)))
+        check("27/11 12h59: ouverte", M.is_us_market_open(ny(2026, 11, 27, 12, 59)))
+        check("27/11 13h00: fermee (fermeture anticipee)", not M.is_us_market_open(ny(2026, 11, 27, 13, 0)))
+        check("24/12 13h30: fermee", not M.is_us_market_open(ny(2026, 12, 24, 13, 30)))
+        check("16h00 pile: fermee", not M.is_us_market_open(ny(2026, 10, 26, 16, 0)))
+        check("9h30 pile: ouverte", M.is_us_market_open(ny(2026, 10, 26, 9, 30)))
+        check("ouverture suivante apres le 25/11 au soir = 27/11 9h30",
+              M.get_next_us_market_open(ny(2026, 11, 25, 17, 0)) == ny(2026, 11, 27, 9, 30))
+        with with_env({"TRADING_MAX_HOLD_SESSIONS": "5", "TRADING_MAX_HOLD_MIN_BEFORE_CLOSE": "30"}):
+            check("27/11: fenetre de sortie 12h30-13h00", M.is_max_hold_window(ny(2026, 11, 27, 12, 40))
+                  and not M.is_max_hold_window(ny(2026, 11, 27, 15, 40)))
+            check("Thanksgiving: aucune sortie forcee", not M.is_max_hold_window(ny(2026, 11, 26, 15, 40)))
+        h = _bars(pd.DatetimeIndex([pd.Timestamp("2026-11-27 11:30", tz=NY), pd.Timestamp("2026-11-27 12:30", tz=NY)]))
+        check("27/11 13h05: barre 12h30 cloturee a 13h", len(M.drop_forming_bar(h, "1h", ny(2026, 11, 27, 13, 5))) == 2)
+
+        an = {"bar_ts": "2026-10-26T10:30:00-04:00", "data_source": "yahoo"}
+        open_t = ny(2026, 10, 26, 11, 30)
+        check("garde: premier scan apres la barre -> achat autorise",
+              M.scan_buy_block_reason(an, bar_already_seen=False, now=open_t) == "")
+        check("garde: barre deja evaluee -> refuse",
+              "deja evaluee" in M.scan_buy_block_reason(an, bar_already_seen=True, now=open_t))
+        check("garde: sortie duree max dans le scan -> refuse",
+              M.scan_buy_block_reason(an, bar_already_seen=False, entries_blocked_reason="sortie", now=open_t) == "sortie")
+        check("garde: bougies IBKR -> refuse", "ibkr" in M.scan_buy_block_reason(
+            {**an, "data_source": "ibkr"}, bar_already_seen=False, now=open_t))
+        check("garde: jour ferie -> refuse", "fermee" in M.scan_buy_block_reason(
+            an, bar_already_seen=False, now=ny(2026, 11, 26, 11, 30)))
+
+    check("sortie sans fill: niveau SL le plus proche du cours",
+          M.estimate_exit_without_fill(91.0, 90.0, 125.0, 100.0) == (90.0, "estime_niveau_sl"))
+    check("sortie sans fill: niveau TP", M.estimate_exit_without_fill(124.0, 90.0, 125.0, 100.0) == (125.0, "estime_niveau_tp"))
+    check("sortie sans fill ni SL/TP: cours", M.estimate_exit_without_fill(97.0, None, None, 100.0) == (97.0, "reference_price"))
+
+    leak = "HTTPSConnectionPool: /bot1234567890:FAKEtokenFAKEtokenFAKEtoken0123456789/getUpdates ?token=abc123&x=1 apikey=zz"
+    red = M.redact_secrets(leak)
+    check("token Telegram masque", "FAKEtoken" not in red and "bot<TOKEN>" in red, red)
+    check("cles API en query string masquees", "abc123" not in red and "apikey=<SECRET>" in red, red)
+
+    tmp = tempfile.mkdtemp()
+    pf = os.path.join(tmp, "positions.json")
+    with open(pf, "w", encoding="utf-8") as f:
+        f.write('{"PLTR": {"in_position": tr')
+    with with_env({"TELEGRAM_BOT_TOKEN": "", "TELEGRAM_CHAT_ID": ""}):
+        got = M.load_positions(pf)
+    check("positions.json illisible: etat vide + achats bloques", got == {} and M.positions_file_corrupt())
+    check("copie de sauvegarde creee", any(n.startswith("positions.json.corrupt-") for n in os.listdir(tmp)))
+    M.save_positions(pf, {})
+    with open(pf, encoding="utf-8") as f:
+        check("fichier illisible jamais ecrase", f.read().startswith('{"PLTR"'))
+    with open(pf, "w", encoding="utf-8") as f:
+        json.dump({"PLTR": {"in_position": False}}, f)
+    check("fichier repare: deblocage", M.load_positions(pf) and not M.positions_file_corrupt())
+
+    import ibkr_execution as X
+    saved = (X.reconcile_ibkr_orders_and_positions, M.ibkr_auto_execute_enabled)
+    X.reconcile_ibkr_orders_and_positions = lambda: (
+        {"RKLB": (14.0, 50.0), "AAPL": (3.0, 200.0), "SOFI": (-5.0, 15.0)}, ["BUY HOOD MKT #12"])
+    M.ibkr_auto_execute_enabled = lambda: True
+    try:
+        jf = os.path.join(tmp, "journal.jsonl")
+        positions = {}
+        with with_env({"TICKERS_OVERRIDE": "PLTR,RKLB,SOFI", "BUY_FIXED_SL_TP_ENABLED": "1", "BUY_FIXED_STOP_PCT": "10",
+                       "BUY_RR_REWARD_MULT": "2.5", "BUY_SNIPER_MODE": "1", "BUY_SNIPER_MAX_STOP_PCT": "10"}):
+            n = M.reconcile_ibkr_positions(positions, pf, journal_file=jf, journal_enabled=True)
+        st = positions.get("RKLB", {})
+        check("position IBKR inconnue de l'univers: reprise en gestion", n == 1 and st.get("in_position")
+              and abs(float(st.get("entry_price_usd", 0)) - 50.0) < 1e-9, str(st))
+        check("reprise: SL -10 % / TP +25 % du prix moyen",
+              abs(float(st.get("stop_loss", 0)) - 45.0) < 0.011 and abs(float(st.get("take_profit", 0)) - 62.5) < 0.011)
+        check("hors univers et short: pas repris", "AAPL" not in positions and not positions.get("SOFI", {}).get("in_position"))
+        with open(jf, encoding="utf-8") as f:
+            ev = [json.loads(x) for x in f if x.strip()]
+        check("reprise tracee au journal", any(e.get("event") == "confirm_buy" and e.get("source") == "ibkr_reconcile"
+                                               for e in ev))
+    finally:
+        X.reconcile_ibkr_orders_and_positions, M.ibkr_auto_execute_enabled = saved
+
+    jf2 = os.path.join(tmp, "pdt.jsonl")
+    with open(jf2, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"event": "ibkr_order_filled", "side": "BUY", "ticker": "HOOD",
+                            "ts_utc": "2026-10-26T14:00:00Z"}) + "\n")
+        f.write(json.dumps({"event": "trade_closed", "ticker": "HOOD", "ts_utc": "2026-10-27T14:05:00Z",
+                            "exit_fill_ts_utc": "2026-10-26T18:30:00Z"}) + "\n")
+    check("PDT: stop du jour constate le lendemain = day trade",
+          M.count_recent_day_trades(jf2, ny(2026, 10, 27, 12, 0)) == 1)
+
+    calls = []
+
+    @M.order_critical
+    def fake_order():
+        M._STOP_REQUESTED = True     # SIGTERM recu pendant l'ordre
+        calls.append("fini")
+        return "ok"
+
+    try:
+        fake_order()
+        check("SIGTERM pendant un ordre: arret apres l'ordre", False)
+    except SystemExit:
+        check("SIGTERM pendant un ordre: l'ordre se termine, puis arret", calls == ["fini"])
+    finally:
+        M._STOP_REQUESTED = False
+
+
 def main_tests():
     test_sessions_held()
     test_max_hold_window()
@@ -504,6 +612,7 @@ def main_tests():
     test_cockpit_summary()
     test_line_steps()
     test_daily_context_before_signal_bar()
+    test_calendar_and_order_guards()
     import test_execution_safety as T
     print("\nResultat: %d OK / %d FAIL" % (T.PASS, T.FAIL))
     return T.FAIL

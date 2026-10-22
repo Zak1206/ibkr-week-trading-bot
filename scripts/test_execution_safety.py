@@ -358,6 +358,198 @@ def test_flat_catchup_helpers():
         check("23h NY: hors catchup max", not bot.is_intraday_flat_catchup_window(late))
 
 
+class _FakeStatus:
+    def __init__(self, status, filled=0.0, avg=0.0):
+        self.status, self.filled, self.avgFillPrice, self.whyHeld = status, filled, avg, ""
+
+
+class _FakeTrade:
+    """Ordre IBKR simule: reste PreSubmitted, sauf si l'annulation est acceptee."""
+
+    def __init__(self, status="PreSubmitted", cancel_works=True, fill_on_cancel=0.0):
+        self.orderStatus = _FakeStatus(status)
+        self.order = type("O", (), {"orderId": 7, "action": "BUY"})()
+        self.contract = type("C", (), {"symbol": "TST"})()
+        self.log = []
+        self.cancel_works, self.fill_on_cancel = cancel_works, fill_on_cancel
+
+    def isDone(self):
+        return self.orderStatus.status in {"Filled", "Cancelled", "ApiCancelled", "Inactive"}
+
+
+class _FakeIB:
+    def __init__(self, trade):
+        self.trade, self.cancels = trade, 0
+
+    def sleep(self, _s):
+        pass
+
+    def cancelOrder(self, _order):
+        self.cancels += 1
+        t = self.trade
+        if t.fill_on_cancel:
+            t.orderStatus = _FakeStatus("Filled", t.fill_on_cancel, 10.0)
+        elif t.cancel_works:
+            t.orderStatus = _FakeStatus("Cancelled")
+
+
+def test_wait_fill_cancels_on_timeout():
+    print("\n[12] _wait_fill — un ordre non rempli a temps est annule (jamais laisse vivant)")
+    from ibkr_execution import IBKRSession, ORDER_CANCEL_UNCONFIRMED
+
+    class S(IBKRSession):
+        def __init__(self, trade):
+            self.ib = _FakeIB(trade)
+
+    t = _FakeTrade()
+    s = S(t)
+    try:
+        s._wait_fill(t, 0.01, requested_qty=5)
+        check("timeout: leve une erreur", False)
+    except RuntimeError as exc:
+        check("timeout: ordre annule chez IBKR", s.ib.cancels >= 1 and t.orderStatus.status == "Cancelled")
+        check("timeout: message dit 'annule'", "annule" in str(exc).lower() and ORDER_CANCEL_UNCONFIRMED not in str(exc),
+              str(exc))
+    t2 = _FakeTrade(cancel_works=False)
+    try:
+        S(t2)._wait_fill(t2, 0.01, requested_qty=5)
+        check("annulation refusee: leve une erreur", False)
+    except RuntimeError as exc:
+        check("annulation non confirmee: signalee", ORDER_CANCEL_UNCONFIRMED in str(exc), str(exc))
+    t3 = _FakeTrade(fill_on_cancel=5.0)
+    filled, avg, status, partial, _ = S(t3)._wait_fill(t3, 0.01, requested_qty=5)
+    check("fill pendant l'annulation: le fill est rendu, pas une erreur", filled == 5.0 and avg == 10.0 and not partial)
+
+
+def test_buy_failure_settles_orders():
+    print("\n[13] market_buy_usd — echec final: ordres BUY annules, fill tardif recupere")
+    from ibkr_execution import IBKRSession, ExecutionResult, ORDER_CANCEL_UNCONFIRMED
+
+    class S(IBKRSession):
+        def __init__(self, late=None, err="Timeout 90s sans fill — ordre annule"):
+            self.placed, self.buy_cancels, self.late_checks, self.late, self.err = 0, 0, 0, late, err
+
+        def ensure_connected(self):
+            pass
+
+        def _contract(self, t):
+            return t
+
+        def position_quantity(self, t):
+            return 0.0
+
+        def _reference_price(self, c):
+            return 10.0
+
+        def force_reconnect(self, *, cancel_ticker=None):
+            pass
+
+        def _place_and_wait_market(self, *a, **k):
+            self.placed += 1
+            raise RuntimeError(self.err)
+
+        def _cancel_open_buy_orders_for_symbol(self, sym):
+            self.buy_cancels += 1
+            return True
+
+        def _recover_late_buy_fill(self, *a, **k):
+            self.late_checks += 1
+            return self.late
+
+    with with_env({"IBKR_ORDER_RETRY": "1", "IBKR_ORDER_RETRY_DELAY_SEC": "0", "IBKR_FRACTIONAL": "0",
+                   "IBKR_WHOLE_SHARE_ROUND_NEAREST": "0"}):
+        s = S()
+        res = s.market_buy_usd("TST", 100.0, stop_loss=9.0, take_profit=12.5)
+        check("2 essais puis echec", not res.ok and s.placed == 2, f"placed={s.placed}")
+        check("apres le dernier essai: BUY annules + fill tardif verifie", s.buy_cancels >= 1 and s.late_checks >= 2,
+              f"cancels={s.buy_cancels} late={s.late_checks}")
+        late = ExecutionResult(ok=True, ticker="TST", side="BUY", quantity=10, fill_price=10.0)
+        s2 = S(late=None)
+        s2._recover_late_buy_fill = lambda *a, **k: late if s2.placed >= 2 else None
+        res2 = s2.market_buy_usd("TST", 100.0, stop_loss=9.0, take_profit=12.5)
+        check("fill tardif apres le dernier essai: rendu comme un achat", res2.ok and res2.quantity == 10)
+        s3 = S(err="Timeout 90s sans fill — " + ORDER_CANCEL_UNCONFIRMED)
+        res3 = s3.market_buy_usd("TST", 100.0, stop_loss=9.0, take_profit=12.5)
+        check("annulation non confirmee: pas de 2e ordre", not res3.ok and s3.placed == 1, f"placed={s3.placed}")
+
+
+def test_sell_unconfirmed_cancel_keeps_brackets_off():
+    print("\n[14] market_sell_all — vente peut-etre encore vivante: SL/TP NON reposes (pas de short)")
+    from ibkr_execution import IBKRSession, ORDER_CANCEL_UNCONFIRMED
+
+    class S(IBKRSession):
+        def __init__(self):
+            self.restored, self.placed = None, 0
+
+        def ensure_connected(self):
+            pass
+
+        def position_quantity(self, t):
+            return 4.0
+
+        def _open_exit_orders_for_symbol(self, sym):
+            return 150.0, 160.0
+
+        def _cancel_open_orders_for_symbol(self, sym, **k):
+            return True
+
+        def _contract(self, t):
+            return t
+
+        def _place_and_wait_market(self, *a, **k):
+            self.placed += 1
+            raise RuntimeError("Timeout 45s sans fill — " + ORDER_CANCEL_UNCONFIRMED)
+
+        def _restore_protective_orders(self, t, sl, tp):
+            self.restored = (sl, tp)
+            return "SL/TP reposes"
+
+    with with_env({"IBKR_ORDER_RETRY": "1", "IBKR_ORDER_RETRY_DELAY_SEC": "0"}):
+        s = S()
+        res = s.market_sell_all("COIN")
+        check("echec, un seul ordre (pas de retry sur ordre vivant)", not res.ok and s.placed == 1, f"placed={s.placed}")
+        check("SL/TP non reposes", s.restored is None)
+        check("erreur explicite", ORDER_CANCEL_UNCONFIRMED in (res.error or ""), res.error)
+
+
+def test_midprice_unconfirmed_cancel_no_top_up():
+    print("\n[15] MIDPRICE non annule: pas de complement au marche (anti sur-achat)")
+    from ibkr_execution import IBKRSession
+
+    class S(IBKRSession):
+        def __init__(self):
+            self.market_orders = 0
+            self.ib = self
+
+        def bid_ask_snapshot(self, c):
+            return None, None
+
+        def _try_midprice(self, c, *, action, qty):
+            return 0.0, 0.0, 9, "MIDPRICE non rempli", False
+
+        def placeOrder(self, c, o):
+            self.market_orders += 1
+            raise AssertionError("pas d'ordre au marche")
+
+    with with_env({"IBKR_ENTRY_ORDER_TYPE": "MIDPRICE", "IBKR_OUTSIDE_RTH": "0", "IBKR_LOG_SPREAD": "0"}):
+        s = S()
+        try:
+            s._place_and_wait_market("TST", action="BUY", quantity=5)
+            check("leve une erreur", False)
+        except RuntimeError as exc:
+            check("aucun ordre au marche envoye", s.market_orders == 0, str(exc))
+
+
+def test_execution_time_is_utc():
+    print("\n[16] heure d'execution IBKR: datetime UTC conserve (pas +4h)")
+    from datetime import datetime, timezone
+    from ibkr_execution import _execution_time_utc
+
+    e = type("E", (), {"time": datetime(2026, 10, 6, 14, 30, 48, tzinfo=timezone.utc)})()
+    got = _execution_time_utc(e)
+    check("14:30:48Z reste 14:30:48Z", got == datetime(2026, 10, 6, 14, 30, 48, tzinfo=timezone.utc), str(got))
+
+
 def main_tests():
     print("=== Tests securite execution (sans IBKR) ===")
     test_recalc_sl_tp_at_fill_fixed_mode()
@@ -371,6 +563,11 @@ def main_tests():
     test_protective_order_filter()
     test_ibkr_close_label_no_pnl_heuristic()
     test_flat_catchup_helpers()
+    test_wait_fill_cancels_on_timeout()
+    test_buy_failure_settles_orders()
+    test_sell_unconfirmed_cancel_keeps_brackets_off()
+    test_midprice_unconfirmed_cancel_no_top_up()
+    test_execution_time_is_utc()
     print(f"\nResultat: {PASS} OK / {FAIL} FAIL")
     sys.exit(1 if FAIL else 0)
 
