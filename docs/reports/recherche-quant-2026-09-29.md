@@ -622,6 +622,41 @@ Backtest avec 8 tickers et 1 ligne, chaque période repartant de 1000 $ :
 - Le protocole du verdict est figé avant le premier trade, dans
   `docs/protocole-verdict-bot.md`.
 
+## 15. Univers de secours quand les 8 sont baissiers ? (21/10, `research_fallback_universe.py`)
+
+Idée de Zak, après 8 séances sans signal (les 8 tickers en tendance baissière) :
+trader un autre panier haussier et volatil, le temps que l'univers reparte.
+Règles figées avant le premier lancement :
+
+- les 8 restent scannés et prioritaires ;
+- le jour J, si au moins 6 des 8 ont une tendance journalière ≤ 0 à la
+  clôture de la veille, les signaux du pool de secours sont acceptés ;
+- pool de secours : les 107 autres titres du pool, filtrés chaque mois par la
+  règle mécanique de `universe_review.py` (38 titres en moyenne) ;
+- même stratégie et même sortie que le paper, 1 × 1000 $ fixe ;
+- adoption seulement si la règle bat les 8 fixes en train et en test, seuils
+  voisins (5 et 7) compris.
+
+| variante | train | 18 derniers mois | DD test | trades de secours (test) |
+|---|---|---|---|---|
+| 8 fixes (actuels) | +759 $ | +926 $ | −18 % | — |
+| **secours, seuil 6/8** | +488 $ | **+222 $** | **−54 %** | 19, +58 $ |
+| secours, seuil 5/8 | −246 $ | +377 $ | −29 % | 23, +235 $ |
+| secours, seuil 7/8 | +644 $ | +1422 $ | −22 % | 17, +620 $ |
+| seuil 6/8, pool sans filtre de volatilité | +619 $ | +492 $ | −54 % | 23, +99 $ |
+| pool ouvert tous les jours | +303 $ | +793 $ | −40 % | 42, +818 $ |
+
+**Rejeté.** Aucun seuil ne bat les 8 fixes sur les deux périodes. Le seuil 7/8
+brille en test mais perd en train, et ses voisins s'effondrent : même profil
+que la règle « les 8 plus volatils » de la section 12, de la chance. À 6/8, la
+chute de −54 % déclencherait le coupe-circuit.
+
+Pourquoi ça perd même quand les trades de secours gagnent : avec une seule
+ligne, un trade de secours occupe la place au moment où les 8 repartent.
+Les trades des 8 ratés pendant ce temps rapportaient +278 à +616 $ selon le
+seuil (run unique, période test). Les meilleurs trades de la stratégie sont
+justement ceux du rebond de l'univers.
+
 ## Audit indépendant des scripts
 
 Un audit en lecture seule n'a trouvé aucun look-ahead dans les générateurs de
@@ -664,4 +699,5 @@ de leur barre. Points relevés :
 .\.venv\Scripts\python.exe scripts\research_mr_longhistory.py  # RSI(2) sur 25 ans
 .\.venv\Scripts\python.exe scripts\research_tickers.py download
 .\.venv\Scripts\python.exe scripts\research_tickers.py eval
+.\.venv\Scripts\python.exe scripts\research_fallback_universe.py   # univers de secours (section 15)
 ```
