@@ -91,6 +91,12 @@ git pull && docker compose up -d --build   # mise à jour du code
 
 `watch_gateway.sh` tourne chaque minute (cron de l'utilisateur `ubuntu`). Si le port API 4002 reste fermé 3 minutes, il relance le conteneur Gateway pour refaire un login avec le mot de passe, puis redémarre le bot. Un redémarrage sain de 23h45 (~20 s) ne le déclenche pas. Au plus 2 relances par heure. Il vérifie aussi que le bot voit le port 4004 de la Gateway : si Docker a relancé le conteneur Gateway tout seul (vu le 19/10 à 23h45), le bot reste dans l'ancien réseau (plus de DNS, plus d'IBKR, plus de Telegram) et il le redémarre. Journal : `deploy/oracle/gateway_watch.log`.
 
+`boot_report.sh` (cron `@reboot` de l'utilisateur `ubuntu`) envoie un message Telegram 7 minutes après chaque redémarrage de la VM : état des conteneurs, port API 4002, bot connecté ou non. Sans lui, une Gateway qui ne revient pas passerait inaperçue, puisque le bot n'envoie son message de démarrage qu'une fois connecté. Journal : `deploy/oracle/boot_report.log`.
+
+```sh
+(crontab -l; echo "@reboot /home/ubuntu/Trading_Bot/deploy/oracle/boot_report.sh") | crontab -
+```
+
 L'état (`positions.json`, `trades_journal.jsonl`…) vit dans `~/Trading_Bot` sur la VM. Pour récupérer le journal sur le PC :
 
 ```powershell
