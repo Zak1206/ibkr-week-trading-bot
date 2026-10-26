@@ -550,6 +550,40 @@ def test_execution_time_is_utc():
     check("14:30:48Z reste 14:30:48Z", got == datetime(2026, 10, 6, 14, 30, 48, tzinfo=timezone.utc), str(got))
 
 
+def test_ibkr_request_without_answer_times_out():
+    print("\n[17] requete IBKR sans reponse (reset serveur IBKR, 23/10 04h30 UTC): delai, rapprochement saute")
+    import time
+    from ib_insync import util
+    from ibkr_execution import IBKRSession, reconcile_ibkr_orders_and_positions
+
+    with with_env({"IBKR_REQUEST_TIMEOUT_SEC": None}):
+        s = IBKRSession()
+    timeout = float(s.ib.RequestTimeout or 0)
+    check("delai par defaut > 0 (0 = attente infinie)", timeout > 0, f"RequestTimeout={timeout}")
+    if timeout <= 0:
+        return  # sans delai, la suite bloquerait le test pour toujours
+    check("delai par defaut > timeout historique ib_insync (60 s)", timeout > 60, f"RequestTimeout={timeout}")
+
+    with with_env({"IBKR_REQUEST_TIMEOUT_SEC": "0.2"}):
+        s = IBKRSession()
+    s.ensure_connected = lambda: None
+    s.ib.reqPositionsAsync = lambda: util.getLoop().create_future()  # positionEnd jamais recu
+    cancels = []
+    s.cancel_stray_orders = lambda held: cancels.append(held) or []
+    saved = IBKRSession._instance
+    IBKRSession._instance = s
+    t0 = time.monotonic()
+    try:
+        reconcile_ibkr_orders_and_positions()
+        check("positions sans reponse: echec signale (pas de cache perime)", False)
+    except Exception as exc:
+        check("positions sans reponse: echec signale (pas de cache perime)", True, str(exc))
+    finally:
+        IBKRSession._instance = saved
+    check("rendu en moins de 5 s", time.monotonic() - t0 < 5, f"{time.monotonic() - t0:.1f}s")
+    check("aucun ordre annule sur des positions inconnues", not cancels, str(cancels))
+
+
 def main_tests():
     print("=== Tests securite execution (sans IBKR) ===")
     test_recalc_sl_tp_at_fill_fixed_mode()
@@ -568,6 +602,7 @@ def main_tests():
     test_sell_unconfirmed_cancel_keeps_brackets_off()
     test_midprice_unconfirmed_cancel_no_top_up()
     test_execution_time_is_utc()
+    test_ibkr_request_without_answer_times_out()
     print(f"\nResultat: {PASS} OK / {FAIL} FAIL")
     sys.exit(1 if FAIL else 0)
 

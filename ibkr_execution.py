@@ -461,6 +461,10 @@ class IBKRSession:
             raise RuntimeError("ib_insync non installe. Lance: pip install ib-insync")
         self.ib = IB()
         _install_ib_insync_patches(self.ib)
+        # Par defaut 0 = attente infinie: une requete envoyee pendant le reset quotidien des
+        # serveurs IBKR (~04h27 UTC) ne recoit jamais de reponse et bloque le bot (23/10: 17 h).
+        # Au-dessus des 60 s que reqHistoricalData s'accorde deja.
+        self.ib.RequestTimeout = _env_float("IBKR_REQUEST_TIMEOUT_SEC", 90.0)
         self._connected = False
         self._contract_by_symbol: Dict[str, object] = {}
 
@@ -961,13 +965,17 @@ class IBKRSession:
         return filled, avg, int(trade.order.orderId or 0), status, partial, log_tail, note
 
     def positions_by_symbol(self) -> Dict[str, Tuple[float, float]]:
-        """Positions du compte chez IBKR: symbole -> (quantite, prix moyen). Cache rafraichi."""
+        """
+        Positions du compte chez IBKR: symbole -> (quantite, prix moyen). Cache rafraichi.
+        Leve une erreur si IBKR ne repond pas: un cache non rafraichi peut etre vide, et
+        cancel_stray_orders annulerait alors le SL/TP d'une vraie position.
+        """
         self.ensure_connected()
         try:
             self.ib.reqPositions()
             self.ib.sleep(1.0)
-        except Exception:
-            pass
+        except Exception as exc:
+            raise RuntimeError(f"positions IBKR non rafraichies ({str(exc) or type(exc).__name__})") from exc
         out: Dict[str, Tuple[float, float]] = {}
         for pos in self.ib.positions():
             sym = str(getattr(pos.contract, "symbol", "") or "").upper()

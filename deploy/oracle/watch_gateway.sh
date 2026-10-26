@@ -7,9 +7,13 @@
 # Si Docker relance seul le conteneur Gateway, le bot (network_mode
 # service:ib-gateway) reste dans l'ancien reseau : ni DNS ni port 4004.
 # On redemarre alors le bot, ce qui le rattache au reseau de la Gateway.
+# Si le bot tourne mais n'ecrit plus rien depuis 45 min (cycle bloque,
+# 23/10 : 17 h sur une requete IBKR sans reponse), on le redemarre aussi,
+# avec une alerte Telegram.
 set -eu
 
 DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+ROOT=$(CDPATH= cd -- "$DIR/../.." && pwd)
 STATE="$DIR/.gateway_watch.state"
 LOG="$DIR/gateway_watch.log"
 PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/bin"
@@ -43,6 +47,28 @@ bot_cut_off() {
         && ! docker exec oracle-bot-1 python -c "import socket; socket.create_connection(('127.0.0.1', 4004), 2).close()" >/dev/null 2>&1
 }
 
+# Le bot ecrit au moins une ligne par cycle de 30 min, bourse ouverte ou non.
+bot_stalled() {
+    [ -z "$(docker logs --since 45m oracle-bot-1 2>&1 | head -c 1)" ]
+}
+
+env_val() {
+    grep -h "^$1=" "$ROOT/.env" "$ROOT/.env.ibkr_paper" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d "\r\"'"
+}
+
+# Le jeton n'est jamais ecrit dans le journal, seulement le code HTTP.
+alert() {
+    TOKEN=$(env_val TELEGRAM_BOT_TOKEN)
+    CHAT=$(env_val TELEGRAM_CHAT_ID)
+    HTTP="pas de token"
+    if [ -n "$TOKEN" ] && [ -n "$CHAT" ]; then
+        HTTP=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
+            --data-urlencode "chat_id=$CHAT" --data-urlencode "text=$1" \
+            "https://api.telegram.org/bot$TOKEN/sendMessage" || true)
+    fi
+    echo "$(date '+%F %T') alerte Telegram: $HTTP" >> "$LOG"
+}
+
 write_state() {
     cat > "$STATE" <<EOF
 FAILS=$FAILS
@@ -59,6 +85,15 @@ if port_up; then
         cd "$DIR"
         docker compose restart bot >> "$LOG" 2>&1 || true
         LAST_RESTART=$now
+    elif bot_running && bot_stalled; then
+        echo "$(date '+%F %T') bot fige (aucun log depuis 45 min), redemarrage du bot" >> "$LOG"
+        # Etat ecrit avant: l'arret peut durer jusqu'a 300 s (ordre en cours)
+        # et cron relance ce script chaque minute.
+        LAST_RESTART=$now
+        write_state
+        cd "$DIR"
+        docker compose restart bot >> "$LOG" 2>&1 || true
+        alert "Bot fige: aucun log depuis 45 min. Redemarre automatiquement ($(date '+%d/%m %H:%M')). Verifier qu'il se reconnecte a IBKR."
     fi
     write_state
     exit 0
