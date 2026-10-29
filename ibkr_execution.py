@@ -90,6 +90,33 @@ ORDER_CANCEL_UNCONFIRMED = "ANNULATION NON CONFIRMEE"
 _WORKING_STATUSES = frozenset({"ApiPending", "PendingSubmit", "PreSubmitted", "Submitted"})
 
 
+class OrderRejected(RuntimeError):
+    """Ordre refuse par IBKR (Error 201: marge, fonds...): le renvoyer serait refuse pareil."""
+
+
+# Error 201 = ordre refuse par IBKR. ib_insync passe alors l'ordre en Cancelled, mais IBKR
+# renvoie ensuite le statut Inactive, qui l'ecrase: isDone() restait faux, le bot attendait
+# tout le delai, annulait un ordre mort (Error 10147) et retentait (SOFI, 28/10: 4 ordres).
+_ORDER_REJECTED_ERROR_CODES = frozenset({201})
+
+
+def _settle_if_rejected(trade) -> bool:
+    """
+    True si IBKR a refuse l'ordre. L'ordre est alors marque termine, comme ib_insync le fait
+    sur l'erreur: reste Inactive, il serait annule comme orphelin au cycle suivant.
+    """
+    try:
+        rejected = any(
+            int(getattr(entry, "errorCode", 0) or 0) in _ORDER_REJECTED_ERROR_CODES
+            for entry in list(trade.log or [])
+        )
+        if rejected and not trade.isDone():
+            trade.orderStatus.status = "Cancelled"
+        return rejected
+    except Exception:
+        return False
+
+
 def _child_order_status_ok(status: str, filled: float) -> bool:
     """
     Un ordre enfant SL/TP n'est considere actif que sur statut working/filled explicite.
@@ -743,15 +770,16 @@ class IBKRSession:
     ) -> Tuple[float, float, str, bool, str]:
         """
         Attend le fill. Retourne (filled, avg, status, partial, log_tail).
-        Leve RuntimeError si rejet sans fill.
+        Leve RuntimeError si rejet sans fill (OrderRejected si IBKR refuse l'ordre).
         Au-dela du delai, l'ordre (ou son reliquat) est annule et l'annulation attendue:
         un ordre laisse vivant pourrait s'executer plus tard a l'insu du bot.
         """
         deadline = time.time() + timeout_sec
         while time.time() < deadline:
             self.ib.sleep(0.3)
-            if trade.isDone():
+            if trade.isDone() or _settle_if_rejected(trade):
                 break
+        rejected = _settle_if_rejected(trade)
         timed_out = not trade.isDone()
         cancel_ok = self._cancel_trade_and_wait(trade) if timed_out else True
         status, _, log_tail = _trade_status_detail(trade)
@@ -759,6 +787,8 @@ class IBKRSession:
         avg = float(trade.orderStatus.avgFillPrice or 0.0)
 
         if filled <= 0 or avg <= 0:
+            if rejected:
+                raise OrderRejected(_format_order_error(trade, context="Ordre refuse par IBKR"))
             if timed_out:
                 ctx = f"Timeout {timeout_sec:.0f}s sans fill — " + (
                     "ordre annule" if cancel_ok
@@ -864,10 +894,14 @@ class IBKRSession:
             deadline = time.time() + max(1.0, timeout)
             while time.time() < deadline:
                 self.ib.sleep(0.3)
-                if trade.isDone():
+                if trade.isDone() or _settle_if_rejected(trade):
                     break
             filled = float(trade.orderStatus.filled or 0.0)
             avg = float(trade.orderStatus.avgFillPrice or 0.0)
+            if filled <= 0 and _settle_if_rejected(trade):
+                # ordre mort, rien a annuler; le marche tranche (un refus propre au
+                # MIDPRICE ne doit pas bloquer l'achat)
+                return 0.0, 0.0, int(trade.order.orderId or 0), "MIDPRICE refuse par IBKR", True
             settled = True
             if filled + 1e-6 < qty:
                 # non rempli ou partiel: on annule le reliquat et on attend la confirmation
@@ -978,6 +1012,10 @@ class IBKRSession:
             raise RuntimeError(f"positions IBKR non rafraichies ({str(exc) or type(exc).__name__})") from exc
         out: Dict[str, Tuple[float, float]] = {}
         for pos in self.ib.positions():
+            # actions seulement: une conversion EUR->USD laisse une position CASH "EUR"
+            # negative, qui serait signalee "A DECOUVERT" a chaque cycle
+            if str(getattr(pos.contract, "secType", "") or "STK").upper() != "STK":
+                continue
             sym = str(getattr(pos.contract, "symbol", "") or "").upper()
             qty = float(pos.position or 0.0)
             if sym and abs(qty) > 1e-9:
@@ -1753,7 +1791,8 @@ class IBKRSession:
                     )
                     if late is not None:
                         return late
-                notional_usd *= float(os.getenv("IBKR_ORDER_RETRY_SIZE_MULT", "0.85"))
+                # meme taille: la ligne vaut exactement 1000 $ x 1,25^k, comme le backtest
+                # (avant: -15 %, 40 actions SOFI au lieu de 47 le 28/10)
                 retried = True
 
             try:
@@ -1943,7 +1982,8 @@ class IBKRSession:
                 last_error = str(exc) or repr(exc)
                 _last_was_presubmitted = "PreSubmitted" in last_error or "Timeout" in last_error
                 live_order = ORDER_CANCEL_UNCONFIRMED in last_error
-                if attempt == 0 and ibkr_order_retry_enabled() and not live_order:
+                rejected = isinstance(exc, OrderRejected)
+                if attempt == 0 and ibkr_order_retry_enabled() and not live_order and not rejected:
                     continue
                 # Dernier essai rate: aucun ordre BUY ne doit rester vivant, et un fill
                 # survenu pendant l'annulation doit etre recupere (SL/TP poses).

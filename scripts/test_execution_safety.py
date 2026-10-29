@@ -584,6 +584,152 @@ def test_ibkr_request_without_answer_times_out():
     check("aucun ordre annule sur des positions inconnues", not cancels, str(cancels))
 
 
+def test_reconcile_ignores_currency_positions():
+    print("\n[18] rapprochement: une conversion EUR->USD (position CASH EUR.USD) n'est pas une action")
+    from types import SimpleNamespace
+    from ibkr_execution import IBKRSession
+
+    def pos(sec_type, symbol, qty, avg):
+        return SimpleNamespace(
+            contract=SimpleNamespace(secType=sec_type, symbol=symbol), position=qty, avgCost=avg
+        )
+
+    s = IBKRSession()
+    s.ensure_connected = lambda: None
+    s.ib.reqPositions = lambda: None
+    s.ib.sleep = lambda _sec: None
+    s.ib.positions = lambda: [pos("STK", "SOFI", 47.0, 16.98), pos("CASH", "EUR", -2160.0, 1.1121)]
+    held = s.positions_by_symbol()
+    check("action SOFI gardee", held.get("SOFI") == (47.0, 16.98), str(held))
+    check("position de change EUR ignoree (pas 'A DECOUVERT')", "EUR" not in held, str(held))
+
+
+def _rejected_trade(order_type="MKT"):
+    """
+    Vrai Trade ib_insync dans l'etat observe le 28/10 (SOFI) et reproduit le 29/10:
+    Inactive, Error 201 (ib_insync passe l'ordre en Cancelled), puis IBKR renvoie Inactive.
+    Avec le vrai isDone(), Inactive n'est pas un etat termine.
+    """
+    from datetime import datetime, timezone
+    from ib_insync import Order, OrderStatus, Stock, Trade
+    from ib_insync.objects import TradeLogEntry
+
+    now = datetime(2026, 10, 28, 14, 30, 35, tzinfo=timezone.utc)
+    reason = ("Error 201, reqId 1450: Order rejected - reason:YOUR ORDER IS NOT ACCEPTED. MINIMUM OF 2000 EUR "
+              "(OR EQUIVALENT IN OTHER CURRENCIES) IS REQUIRED IN ORDER TO <br>PURCHASE ON MARGIN")
+    return Trade(
+        contract=Stock("SOFI", "SMART", "USD"),
+        order=Order(orderId=1450, action="BUY", totalQuantity=47, orderType=order_type),
+        orderStatus=OrderStatus(orderId=1450, status="Inactive", remaining=47),
+        log=[
+            TradeLogEntry(now, "PendingSubmit", ""),
+            TradeLogEntry(now, "Inactive", ""),
+            TradeLogEntry(now, "Cancelled", reason, 201),
+            TradeLogEntry(now, "Inactive", ""),
+        ],
+    )
+
+
+class _RejectingIB:
+    """IB simule: tout ordre est refuse (Error 201). Compte les annulations envoyees."""
+
+    def __init__(self):
+        self.cancels, self.trade = 0, None
+
+    def sleep(self, _s):
+        pass
+
+    def placeOrder(self, _contract, order):
+        self.trade = _rejected_trade(order.orderType)
+        return self.trade
+
+    def cancelOrder(self, _order):
+        self.cancels += 1  # chez IBKR: Error 10147, ordre introuvable
+
+
+def test_rejected_order_fails_fast():
+    print("\n[19] ordre refuse par IBKR (Error 201 puis statut Inactive): echec immediat, pas de timeout")
+    import time
+    from ibkr_execution import IBKRSession, OrderRejected
+
+    class S(IBKRSession):
+        def __init__(self):
+            self.ib = _RejectingIB()
+
+    s = S()
+    t = _rejected_trade()
+    t0 = time.monotonic()
+    try:
+        s._wait_fill(t, 3.0, requested_qty=47)
+        check("refus: leve une erreur", False)
+    except OrderRejected as exc:
+        check("refus: OrderRejected (pas un timeout)", "Timeout" not in str(exc), str(exc))
+        check("refus: la raison IBKR est dans le message", "MINIMUM OF 2000 EUR" in str(exc), str(exc))
+    except RuntimeError as exc:
+        check("refus: OrderRejected (pas un timeout)", False, str(exc))
+    check("refus: rendu sans attendre le delai", time.monotonic() - t0 < 1.0, f"{time.monotonic() - t0:.1f}s")
+    check("refus: aucune annulation d'un ordre deja mort (Error 10147)", s.ib.cancels == 0, f"cancels={s.ib.cancels}")
+    check("refus: ordre marque termine (pas 'orphelin' au cycle suivant)", t.isDone(), t.orderStatus.status)
+
+    with with_env({"IBKR_MIDPRICE_TIMEOUT_SEC": "3"}):
+        s = S()
+        t0 = time.monotonic()
+        filled, _avg, _oid, note, settled = s._try_midprice("SOFI", action="BUY", qty=47.0)
+    check("MIDPRICE refuse: rendu sans attendre 20 s", time.monotonic() - t0 < 1.0, f"{time.monotonic() - t0:.1f}s")
+    check("MIDPRICE refuse: rien rempli, ordre regle", filled == 0 and settled, f"{filled} {settled}")
+    check("MIDPRICE refuse: note explicite", "refuse" in note.lower(), note)
+    check("MIDPRICE refuse: aucune annulation envoyee", s.ib.cancels == 0, f"cancels={s.ib.cancels}")
+
+
+def test_buy_retry_rules():
+    print("\n[20] market_buy_usd — pas de 2e ordre sur un refus IBKR; 2e essai apres timeout = meme taille")
+    from ibkr_execution import IBKRSession, OrderRejected
+
+    class S(IBKRSession):
+        def __init__(self, exc):
+            self.exc, self.qtys, self.reconnects = exc, [], 0
+
+        def ensure_connected(self):
+            pass
+
+        def _contract(self, t):
+            return t
+
+        def position_quantity(self, t):
+            return 0.0
+
+        def _reference_price(self, c):
+            return 10.0
+
+        def force_reconnect(self, *, cancel_ticker=None):
+            self.reconnects += 1
+
+        def _place_and_wait_market(self, contract, *, action, quantity, cash_qty=None):
+            self.qtys.append(quantity)
+            raise self.exc
+
+        def _cancel_open_buy_orders_for_symbol(self, sym):
+            return True
+
+        def _recover_late_buy_fill(self, *a, **k):
+            return None
+
+    env = {"IBKR_ORDER_RETRY": "1", "IBKR_ORDER_RETRY_DELAY_SEC": "0", "IBKR_ALLOW_FRACTIONAL": "0",
+           "IBKR_WHOLE_SHARE_ROUND_NEAREST": "0", "IBKR_MAX_NOTIONAL_USD": "0",
+           "IBKR_ORDER_RETRY_SIZE_MULT": "0.85"}  # valeur du .env de base le 28/10
+    with with_env(env):
+        s = S(OrderRejected("Ordre refuse par IBKR — log=Cancelled: Error 201, reqId 1450: Order rejected"))
+        res = s.market_buy_usd("SOFI", 800.0, stop_loss=9.0, take_profit=12.5)
+        check("refus IBKR: un seul ordre", not res.ok and len(s.qtys) == 1, f"qtys={s.qtys}")
+        check("refus IBKR: pas de reconnexion", s.reconnects == 0, f"reconnects={s.reconnects}")
+        check("refus IBKR: erreur explicite", "Error 201" in (res.error or ""), res.error)
+
+        s = S(RuntimeError("Timeout 90s sans fill — ordre annule — status=Cancelled"))
+        res = s.market_buy_usd("SOFI", 800.0, stop_loss=9.0, take_profit=12.5)
+        check("timeout: 2e essai", len(s.qtys) == 2, f"qtys={s.qtys}")
+        check("timeout: 2e essai a la meme taille (80 actions, pas 68)", s.qtys == [80, 80], f"qtys={s.qtys}")
+
+
 def main_tests():
     print("=== Tests securite execution (sans IBKR) ===")
     test_recalc_sl_tp_at_fill_fixed_mode()
@@ -603,6 +749,9 @@ def main_tests():
     test_midprice_unconfirmed_cancel_no_top_up()
     test_execution_time_is_utc()
     test_ibkr_request_without_answer_times_out()
+    test_reconcile_ignores_currency_positions()
+    test_rejected_order_fails_fast()
+    test_buy_retry_rules()
     print(f"\nResultat: {PASS} OK / {FAIL} FAIL")
     sys.exit(1 if FAIL else 0)
 
